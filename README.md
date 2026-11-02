@@ -1,155 +1,109 @@
-# tdkr_nx — The Dark Knight Rises (Gameloft) for Switch
+# 9mm-nx
 
-A 32-bit (AArch32) wrapper on the **android32** runtime that runs the Android
-build of **The Dark Knight Rises** on Nintendo Switch. No game code or data
-included: it uses your APK and your data files.
+An **unofficial** Nintendo Switch wrapper for *9mm* (Gameloft, Android, armeabi-v7a).
+It runs the game's own 32-bit ARM libraries (`libCopStory.so`, `libStormGLOFT.so`)
+in a Switch homebrew process on top of an Android-compatibility runtime, and
+replaces the Java side the game expects (JNI callbacks, EGL context, input, audio).
 
-## Required version
-
-This build targets and was tested against:
-
-* **The Dark Knight Rises 1.1.6** (`com.gameloft.android.AMAZ.GloftKRAS`,
-  versionCode 116, `lib/armeabi-v7a/libKRAS.so`). The APK is recognised by
-  its contents, not its file name.
-* The extracted data files (`data/`, `textures/`, `welcome/`… ≈ 1.9 GB).
-  OBBs are also accepted (`datakrhm.obb`, optional `patchkrhm.obb`, or
-  `main.<n>.<package>.obb` / `patch.<n>.<package>.obb`).
-
-Other versions are untested.
-
-## Folder on the SD card
-
-```
-sdmc:/switch/tdkr_nx/
-├── tdkr_nx.nro          ← the launcher (Batman forwarder icon)
-├── <any name>.apk
-├── obb/                 ← only if you have OBBs (skip otherwise)
-└── data/files/          ← extracted data
-    ├── data/ textures/ welcome/ ...
-```
-
-`config.ini`, `debug.log`, `libKRAS.so` (unpacked) and `classes.txt` are
-generated on first launch. If you rename the folder, change `PORT_NAME` in
-`source/port_config.h`.
-
-Copy `tdkr_nx.nro` to `sdmc:/switch/tdkr_nx/`, install the forwarder from
-sphaira (Homebrew > The Dark Knight Rises > Install Forwarder) and launch
-the icon.
-
-## Controls (Joy-Cons)
-
-The game is touch-driven (left virtual joystick, right-side buttons, swipe
-to look). The Joy-Cons emulate it with virtual fingers shared with the
-touchscreen (ids 0-15), plus the engine's native gamepad mode (Xperia with
-open slide + announced MOGA: keys through its tables, right stick into its
-own variables).
-
-| Joy-Con | Action |
-| --- | --- |
-| Left stick | drags the virtual joystick (`touch_joy_*`, 158/585 r95, from the SWF) + native arrows 8-way, like the D-pad |
-| D-pad | arrows: menus + D-pad movement (keys 19-22) |
-| Driving | ZL + steered stick enters drive mode, any ZL tap leaves; steer with the left stick (`touch_drive_*`, 640/620 r180, expo curve); `touch_drive_toggle = false` holds ZL instead |
-| Right stick | engine-native camera (`nativeSetPowerARightJoystick`, Y flippable with `gamepad_invert_y`); swipe when `gamepad_native = false` |
-| A | jump (`touch_btn_jump_*` 1030/610: climb, cape) + native key; also confirms menus (key 23), disarms bombs (key 96) |
-| B | attack (`touch_btn_attack_*` 1150/550) + native key; back in menus (key 4) |
-| X | attack (`touch_btn_attack_*` 1150/550: takedowns) + native key |
-| Y | counter (`touch_btn_counter_*` 1150/420: block, strike back) + use tap (`touch_btn_use_*` 1030/480) + native key |
-| ZR | central-third general tap (`touch_btn_center_*` 640/360, its own point) + auto-mash while held + native key |
-| L | sneak (`touch_btn_sneak_*` 1090/350, estimates) + native key |
-| R | grapnel hook (`touch_btn_grapnel_*` 1210/470, estimates: right trigger) + native key |
-| ZL | central-third general tap (`touch_btn_qte_*` 640/360) + drive mode (ZL + steered stick enters, any ZL tap leaves) + native key (104) |
-| Stick clicks | native keys (106/107) |
-| `+` / `-` | Menu / Back |
-| Touchscreen | always live alongside (driving slider, hacks, doors) |
-
-Menu vs gameplay is automatic (like the Dead Space port): the wrapper sees
-which zone the engine opened (`l_menu` = start menu, any other `l_*` =
-Gotham), plus pause panels inside gameplay zones (`+` opens one, `B` goes
-back, moving the stick means gameplay again). Where no full mapping runs
-there are no virtual fingers -- keys plus the touch screen -- so the stick
-can never land on the tech shop button, in the start menu or the pause
-menu; transitions lift everything the other side held. No manual mode
-switch.
-
-Positions are 1280x720 pixels in `[controls]` of `config.ini`. The game's
-buttons move with the context: if a tap misses, tune its coordinate.
-`gamepad_touch = false` leaves touch screen + keys only.
-
-Borrowed from the Dead Space port (`deadspace_nx`): real JNI monitors
-(the runtime's `MonitorEnter`/`Exit` lock nothing; loading threads would
-read each other's shared buffers), the log to a RAM ring past boot
-(flushed every 10 s), the HOME/sleep freeze hook, and the load-only CPU
-boost (a frame past 50 ms boosts until it ends; gameplay never does).
-
-A small centring crosshair is drawn over the frame in gameplay
-(`[display] crosshair`).
-
-## Settings (`config.ini`)
-
-* `[display] resolution`: 720, 1080 or auto. `frame_rate`: 60 or 30 (30
-  runs cooler in handheld). `show_fps`: an `[fps]` line every 2 s (default off).
-* `[performance] boost_cpu_when_loading`: `true` (CPU at 1785 MHz inside
-  loading frames only; gameplay stays at stock clocks). `gpu_boost_handheld`:
-  handheld GPU at 460.8 MHz (`true`; CPU/MEM stock, docked untouched).
-* `[controls]`: everything in the table above.
-* `[debug] log_java_calls`: every Java call (slow; for bug reports only).
-
-## Port files (`source/`)
-
-| file | what it does |
-| --- | --- |
-| `port_config.h` | name, package, APK role, region size, I/O readahead/buffering |
-| `tdkr_main.c` | setup, `libKRAS.so` loading, `init`/`nativeInit`/`setPaths` order, `step`+swap loop, FPS |
-| `tdkr_java.c` | the "Java" the engine calls + native gamepad announce |
-| `tdkr_gl.c` | the EGL/GLSurfaceView Java would have made |
-| `tdkr_audio.c` | `AudioTrack` over audout |
-| `tdkr_input.c` + `touchmap.h/.c` | touchscreen + reusable gamepad→touch/keys mapper |
-| `tdkr_obb.c` | OBB lookup by role + `obb/`→`data/files/` fallback without OBBs |
-| `tdkr_libc.c` | `rewind`, `wcscmp`, `wcscpy` |
-| `tdkr_config.c` | `config.ini` options (migrations included) |
-| `imports.c` | generated: `python3 runtime/tools/gen_imports.py` |
+**This repository contains no Gameloft code or data.** You need your own legally
+obtained copy of the game: the APK and the data the game downloads on its first
+launch. 9mm and Gameloft are trademarks of their owners; this project is not
+affiliated with or endorsed by them.
 
 ## Status
 
-* Menu, open world (Gotham), audio, saves and touch input working; 40-56
-  fps in gameplay once loaded. The menu streams ~200 MB over SD at stock
-  clocks and takes minutes: let it finish.
-* No online services (Gameloft Live, shop, IAB answer empty).
-* Bug reports: send `debug.log` (plus `crash.log` on a crash). For input
-  reports keep `log_java_calls = true` and note which button fails and where
-  it shows on screen.
+Tested on hardware: the main menu and the first mission render with correct
+textures, audio plays. Work in progress; see *Known issues*.
 
-## Build
+## What you need
 
-```sh
-./build.sh              # tdkr_nx.nsp + tdkr_nx.build  (AArch32 toolchain, Docker)
-./launcher/build.sh     # tdkr_nx.nro                  (devkitA64)
+| Item | Where |
+|---|---|
+| 9mm APK (armeabi-v7a, package `com.gameloft.android.ANMP.Gloft9MHM`) | `sdmc:/switch/9mm_nx/` (any file name) |
+| The game's downloaded data (`*.gla`, `sounds_hi.glza`, `*.dat`, ...) | `sdmc:/switch/9mm_nx/gameloft/games/Gloft9MHM/` |
+| `9mm_nx.nro` (built, see below) | `sdmc:/switch/` |
+
+No OBB is used. A Switch on Atmosphere (or any CFW that runs homebrew) is assumed.
+
+## Building
+
+Prerequisites (not included here):
+
+- Docker. The wrapper is built in `ghcr.io/vita2hos/devcontainer/vita2hos:latest`
+  (AArch32 devkitARM); the launcher NRO in `devkitpro/devkita64:latest`.
+- The **android32 runtime** checked out as `./runtime` (a submodule or a plain
+  clone). It provides the ELF loader, the JNI layer, libc/bionic shims and the
+  Mesa/EGL glue. See its own documentation for `portlibs32/` (Mesa for AArch32),
+  which must sit in the project folder to get the real renderer.
+- **libnx32** (the AArch32 libnx fork), prefix in `DCR_LIBNX32` or next to this folder.
+- A launcher icon at `launcher/icon.jpg` (256x256). Not included; use your own.
+
+```powershell
+$env:DCR_LIBNX32 = "C:\path\to\libnx32\prefix"
+.\build.ps1                       # -> 9mm_nx.nsp + 9mm_nx.build
+
+# the launcher NRO carries the payload; rebuild it after every payload change
+$port = (Get-Location).Path; $rt = (Resolve-Path .\runtime).Path
+docker run --rm --platform linux/amd64 -v "${port}:/work" -v "${rt}:/runtime:ro" `
+  -w /work/launcher devkitpro/devkita64:latest bash -lc 'make -j$(nproc) A32=/runtime'
+# -> launcher/9mm_nx.nro
 ```
 
-Requires Docker (image `ghcr.io/vita2hos/devcontainer/vita2hos`), libnx32
-(`DCR_LIBNX32` or `../libnx32/prefix`, see `runtime/tools/docker_build.sh`)
-and mesa32 (`portlibs32/`). Clean rebuild: `./build.sh clean`.
+`debug.log` and `crash.log` are written next to the NRO's data folder
+(`sdmc:/switch/9mm_nx/`).
 
-## Credits
+## Controls
 
-* The Dark Knight Rises: Gameloft (the game; not included).
-* android32 runtime, libnx32, toolchain: aks796, vita2hos, devkitPro.
-* Mesa 3D, miniz: their authors (see their licenses).
-* Original `.so` loader work: Andy Nguyen (TheOfficialFloW), fgsfds.
-* Input/mapping patterns studied from the Ducktales-NX, Sonic All-Stars
-  Racing, TASM2, Modern Combat 3 and Asphalt 8 ports (Thorhax, aks796,
-  Rinnegatamante).
+The game is played with touch; the Joy-Cons and the touch screen are mapped to it
+(positions as in the 9mm Vita port, scaled from 960x544 to 1280x720). Every
+position can be changed in `config.ini` (`controls.touch_*`).
 
-## Disclaimer
+| Switch | Action |
+|---|---|
+| Left stick | movement (floating virtual joystick) |
+| Right stick | camera (a finger that keeps dragging) |
+| R / ZR | fire |
+| L | bullet time |
+| B | sprint (held) |
+| Y | reload |
+| + | pause |
+| D-pad left / right | switch weapon (the game needs a real horizontal swipe) |
+| Touch screen | passed through |
 
-Unofficial fan project, not affiliated with Nintendo or Gameloft. No game
-code or data included: you need your own APK and data files.
+## How it works
 
-### A note on docked vs handheld play
+| File | Role |
+|---|---|
+| `source/nm9_main.c` | loads `libStormGLOFT.so` then `libCopStory.so`, runs the constructors and `JNI_OnLoad`, then what the activity did: `GLResLoader_nativeInit`, `GLGame_nativeInit`, a GLES 2 context, `GameRenderer_nativeInit/Resize`, and the frame loop (`GameRenderer_nativeRender`) |
+| `source/nm9_java.c` | the Java the engine calls back into (`GLGame`, `GameRenderer`, `AudioTrack`, `android.os.Build`, ...). Note: `DetectDeviceGPU`, `getBuildType`, `detectLanguage` and `getWifiIP` return **int**; answering with a string makes the engine pick the wrong texture path |
+| `source/nm9_input.c`, `touchmap.*` | Joy-Con / touch mapping, sampled at 120 Hz so short taps are not lost |
+| `source/nm9_gl.c`, `nm9_gldiag.c` | EGL/GLES 2 context on Mesa (nouveau); frame diagnostics and a present fallback when the engine does not swap by itself |
+| `source/nm9_exc.c` | emulates `SWP`/`SWPB` in the exception hook: the game's lock helpers use this ARMv5 instruction, which the Switch CPU faults on |
+| `source/nm9_pvr.c` | the game's world textures are PVRTC 4bpp and the GPU has none: advertises `GL_IMG_texture_compression_pvrtc` (**in front** of the extension list; appended at the end the engine ignores it) and decodes PVRTC to RGBA8888 on the CPU |
+| `source/nm9_audio.c` | `android.media.AudioTrack` over `audout` |
+| `launcher/` | the NRO: checks the APK, shows setup help, starts the payload |
+| `tools/imports.cfg` | modules and import settings for `gen_imports.py` |
 
-Docked play is fully playable, but some of the game's context actions
-cannot be mapped to physical buttons: they appear as large touch buttons
-placed by the game itself (QTE prompts, takedowns), and on a controller
-they are pressed through the centre crosshair (`ZR`). For that reason the
-game is considerably more enjoyable in handheld mode, where the touch
-screen does those actions directly.
+## Known issues
+
+- PVRTC is decoded on the CPU (about 0.9 ms per 512 KB level here); loading
+  screens cost time. PVRTC 2bpp is not decoded (grey).
+- `SWP` is emulated through an exception: correct but slow when the engine takes
+  its locks a lot. A static patch of the 31 sites is the next step if it shows.
+- The engine logs `unbound parameter ...` for the sampler uniforms of its world
+  shaders; the rendering looks right, but the cause is not explained.
+- `getKeyboardText` returns `NULL`; there is no on-screen keyboard (name entry).
+- Online services, billing, Gameloft Live and DRM natives answer "nothing there".
+- Some leftovers of the original port this was started from remain in
+  `nm9_obb.c` (OBB lookup, unused by this game).
+
+## Credits and licenses
+
+- The game: Gameloft. Not included.
+- The runtime, libnx32, the Mesa AArch32 build: their own projects and licenses;
+  check them before redistributing builds.
+- The 9mm Vita port was used as a reference for the native call signatures and the
+  HUD positions of the controls. Check its license before copying code from it.
+- Earlier ports on the same runtime (The Dark Knight Rises, Tintin) were the
+  starting point and a reference.
+- The code in this repository: MIT (see `LICENSE`).
