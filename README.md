@@ -66,7 +66,7 @@ The original ARM game libraries (libCopStory.so, libStormGLOFT.so) run directly 
 
 - A Nintendo Switch running Atmosphère custom firmware.
 - [sphaira](https://github.com/ITotalJustice/sphaira) for installing the HOME-menu forwarder.
-- Your own supported **1.1.0 ARMv7 APK** (com.gameloft.android.ANMP.Gloft9MHM).
+- Your own supported **1.0.1 ARMv7 APK** (com.gameloft.android.ANMP.Gloft9MHM).
 - Extracted Gameloft SD data folder (Gloft9MHM).
 
 Copy the switch/ folder to the root of your SD card. Ensure the game files are placed according to the layout below:
