@@ -131,7 +131,8 @@ crash.log          Crash diagnostics output
 ### Requirements
 
 - Docker with Linux container support.
-- [android32](https://github.com/aks796/android32) in untime/ (Git submodule).
+- [android32](https://github.com/aks796/android32) in 
+untime/ (Git submodule).
 - [libnx32](https://github.com/aks796/libnx32) prefix (version 4.12.0 or newer).
 - [mesa32](https://github.com/aks796/mesa32) or mesa-switch32 in portlibs32/.
 - devkitPro devkita64 for launcher compilation.
