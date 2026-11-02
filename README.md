@@ -51,7 +51,7 @@ The original ARM game libraries (libCopStory.so, libStormGLOFT.so) run directly 
 
 ## Features
 
-- Original Android **1.1.0** game running natively in AArch32 on Switch.
+- Original Android **1.0.1** game running natively in AArch32 on Switch.
 - **1280 x 720** widescreen presentation with touchscreen and gamepad integration.
 - Floating virtual joystick (left stick) and camera drag (right stick).
 - Direct game SD data mounting (gameloft/games/Gloft9MHM/).
