@@ -1,155 +1,171 @@
-# tdkr_nx — The Dark Knight Rises (Gameloft) for Switch
+<div align="center">
 
-A 32-bit (AArch32) wrapper on the **android32** runtime that runs the Android
-build of **The Dark Knight Rises** on Nintendo Switch. No game code or data
-included: it uses your APK and your data files.
+<img src="launcher/icon.jpg" alt="9mm" width="180">
 
-## Required version
+# 9mm_nx
 
-This build targets and was tested against:
+**9mm on Nintendo Switch**
 
-* **The Dark Knight Rises 1.1.6** (`com.gameloft.android.AMAZ.GloftKRAS`,
-  versionCode 116, `lib/armeabi-v7a/libKRAS.so`). The APK is recognised by
-  its contents, not its file name.
-* The extracted data files (`data/`, `textures/`, `welcome/`… ≈ 1.9 GB).
-  OBBs are also accepted (`datakrhm.obb`, optional `patchkrhm.obb`, or
-  `main.<n>.<package>.obb` / `patch.<n>.<package>.obb`).
+An unofficial Nintendo Switch wrapper/port of Gameloft's Android game.
 
-Other versions are untested.
+[![Switch](https://img.shields.io/badge/Nintendo_Switch-Homebrew-E60012?style=for-the-badge&logo=nintendoswitch&logoColor=white)](#installation)
+[![Version](https://img.shields.io/badge/version-v1.0.0-4C8BF5?style=for-the-badge)](#)
+[![Android](https://img.shields.io/badge/Android-1.1.0-3DDC84?style=for-the-badge&logo=android&logoColor=white)](#about)
+[![AArch32](https://img.shields.io/badge/AArch32-32--bit-0091BD?style=for-the-badge&logo=arm&logoColor=white)](#building)
 
-## Folder on the SD card
+</div>
 
-```
-sdmc:/switch/tdkr_nx/
-├── tdkr_nx.nro          ← the launcher (Batman forwarder icon)
-├── <any name>.apk
-├── obb/                 ← only if you have OBBs (skip otherwise)
-└── data/files/          ← extracted data
-    ├── data/ textures/ welcome/ ...
-```
+---
 
-`config.ini`, `debug.log`, `libKRAS.so` (unpacked) and `classes.txt` are
-generated on first launch. If you rename the folder, change `PORT_NAME` in
-`source/port_config.h`.
+## About
 
-Copy `tdkr_nx.nro` to `sdmc:/switch/tdkr_nx/`, install the forwarder from
-sphaira (Homebrew > The Dark Knight Rises > Install Forwarder) and launch
-the icon.
+9mm_nx runs the original 32-bit Android version of **9mm** on Nintendo Switch, using the open-source [android32](https://github.com/aks796/android32) runtime.
 
-## Controls (Joy-Cons)
+The supported game build is:
 
-The game is touch-driven (left virtual joystick, right-side buttons, swipe
-to look). The Joy-Cons emulate it with virtual fingers shared with the
-touchscreen (ids 0-15), plus the engine's native gamepad mode (Xperia with
-open slide + announced MOGA: keys through its tables, right stick into its
-own variables).
+`	ext
+Package:      com.gameloft.android.ANMP.Gloft9MHM
+Version:      1.1.0
+Version code: 110
+ABI:          armeabi-v7a / AArch32
+`
 
-| Joy-Con | Action |
-| --- | --- |
-| Left stick | drags the virtual joystick (`touch_joy_*`, 158/585 r95, from the SWF) + native arrows 8-way, like the D-pad |
-| D-pad | arrows: menus + D-pad movement (keys 19-22) |
-| Driving | ZL + steered stick enters drive mode, any ZL tap leaves; steer with the left stick (`touch_drive_*`, 640/620 r180, expo curve); `touch_drive_toggle = false` holds ZL instead |
-| Right stick | engine-native camera (`nativeSetPowerARightJoystick`, Y flippable with `gamepad_invert_y`); swipe when `gamepad_native = false` |
-| A | jump (`touch_btn_jump_*` 1030/610: climb, cape) + native key; also confirms menus (key 23), disarms bombs (key 96) |
-| B | attack (`touch_btn_attack_*` 1150/550) + native key; back in menus (key 4) |
-| X | attack (`touch_btn_attack_*` 1150/550: takedowns) + native key |
-| Y | counter (`touch_btn_counter_*` 1150/420: block, strike back) + use tap (`touch_btn_use_*` 1030/480) + native key |
-| ZR | central-third general tap (`touch_btn_center_*` 640/360, its own point) + auto-mash while held + native key |
-| L | sneak (`touch_btn_sneak_*` 1090/350, estimates) + native key |
-| R | grapnel hook (`touch_btn_grapnel_*` 1210/470, estimates: right trigger) + native key |
-| ZL | central-third general tap (`touch_btn_qte_*` 640/360) + drive mode (ZL + steered stick enters, any ZL tap leaves) + native key (104) |
-| Stick clicks | native keys (106/107) |
-| `+` / `-` | Menu / Back |
-| Touchscreen | always live alongside (driving slider, hacks, doors) |
+The original ARM game libraries (libCopStory.so, libStormGLOFT.so) run directly inside a 32-bit Horizon OS process. Players must provide their own APK and game data files (gameloft/games/Gloft9MHM/); these are not included in the repository or release download.
 
-Menu vs gameplay is automatic (like the Dead Space port): the wrapper sees
-which zone the engine opened (`l_menu` = start menu, any other `l_*` =
-Gotham), plus pause panels inside gameplay zones (`+` opens one, `B` goes
-back, moving the stick means gameplay again). Where no full mapping runs
-there are no virtual fingers -- keys plus the touch screen -- so the stick
-can never land on the tech shop button, in the start menu or the pause
-menu; transitions lift everything the other side held. No manual mode
-switch.
+**No game files are included.** You need your own copy of the game's APK. This project is not affiliated with or endorsed by Gameloft or Nintendo.
 
-Positions are 1280x720 pixels in `[controls]` of `config.ini`. The game's
-buttons move with the context: if a tap misses, tune its coordinate.
-`gamepad_touch = false` leaves touch screen + keys only.
-
-Borrowed from the Dead Space port (`deadspace_nx`): real JNI monitors
-(the runtime's `MonitorEnter`/`Exit` lock nothing; loading threads would
-read each other's shared buffers), the log to a RAM ring past boot
-(flushed every 10 s), the HOME/sleep freeze hook, and the load-only CPU
-boost (a frame past 50 ms boosts until it ends; gameplay never does).
-
-A small centring crosshair is drawn over the frame in gameplay
-(`[display] crosshair`).
-
-## Settings (`config.ini`)
-
-* `[display] resolution`: 720, 1080 or auto. `frame_rate`: 60 or 30 (30
-  runs cooler in handheld). `show_fps`: an `[fps]` line every 2 s (default off).
-* `[performance] boost_cpu_when_loading`: `true` (CPU at 1785 MHz inside
-  loading frames only; gameplay stays at stock clocks). `gpu_boost_handheld`:
-  handheld GPU at 460.8 MHz (`true`; CPU/MEM stock, docked untouched).
-* `[controls]`: everything in the table above.
-* `[debug] log_java_calls`: every Java call (slow; for bug reports only).
-
-## Port files (`source/`)
-
-| file | what it does |
-| --- | --- |
-| `port_config.h` | name, package, APK role, region size, I/O readahead/buffering |
-| `tdkr_main.c` | setup, `libKRAS.so` loading, `init`/`nativeInit`/`setPaths` order, `step`+swap loop, FPS |
-| `tdkr_java.c` | the "Java" the engine calls + native gamepad announce |
-| `tdkr_gl.c` | the EGL/GLSurfaceView Java would have made |
-| `tdkr_audio.c` | `AudioTrack` over audout |
-| `tdkr_input.c` + `touchmap.h/.c` | touchscreen + reusable gamepad→touch/keys mapper |
-| `tdkr_obb.c` | OBB lookup by role + `obb/`→`data/files/` fallback without OBBs |
-| `tdkr_libc.c` | `rewind`, `wcscmp`, `wcscpy` |
-| `tdkr_config.c` | `config.ini` options (migrations included) |
-| `imports.c` | generated: `python3 runtime/tools/gen_imports.py` |
+> Work in progress.
 
 ## Status
 
-* Menu, open world (Gotham), audio, saves and touch input working; 40-56
-  fps in gameplay once loaded. The menu streams ~200 MB over SD at stock
-  clocks and takes minutes: let it finish.
-* No online services (Gameloft Live, shop, IAB answer empty).
-* Bug reports: send `debug.log` (plus `crash.log` on a crash). For input
-  reports keep `log_java_calls = true` and note which button fails and where
-  it shows on screen.
+| Feature | State |
+| --- | --- |
+| Boot, loading, 3D gameplay | working ✓ |
+| Touchscreen | working ✓ |
+| Audio (AudioTrack on audout) | working ✓ |
+| Gamepad: movement (left stick), camera (right stick) | working ✓ |
+| Gamepad: R/ZR fire, L bullet time, B sprint, Y reload, + pause | working ✓ |
+| D-pad weapon switching | working ✓ |
+| Intro and cutscene videos | skipped (the game is told they finished) |
+| Online features / Gameloft Live | not implemented |
 
-## Build
+## Features
 
-```sh
-./build.sh              # tdkr_nx.nsp + tdkr_nx.build  (AArch32 toolchain, Docker)
-./launcher/build.sh     # tdkr_nx.nro                  (devkitA64)
-```
+- Original Android **1.1.0** game running natively in AArch32 on Switch.
+- **1280 x 720** widescreen presentation with touchscreen and gamepad integration.
+- Floating virtual joystick (left stick) and camera drag (right stick).
+- Direct game SD data mounting (gameloft/games/Gloft9MHM/).
+- Native checkpoint saves and settings persistence.
+- Audio playback via android32 AudioTrack / OpenSL ES driver.
+- PVRTC texture decompression on CPU (4bpp supported, 2bpp displays grey).
+- 64-bit NRO launcher carrying the 32-bit payload with sphaira HOME-menu forwarder support.
 
-Requires Docker (image `ghcr.io/vita2hos/devcontainer/vita2hos`), libnx32
-(`DCR_LIBNX32` or `../libnx32/prefix`, see `runtime/tools/docker_build.sh`)
-and mesa32 (`portlibs32/`). Clean rebuild: `./build.sh clean`.
+## Installation
+
+### Requirements
+
+- A Nintendo Switch running Atmosphère custom firmware.
+- [sphaira](https://github.com/ITotalJustice/sphaira) for installing the HOME-menu forwarder.
+- Your own supported **1.1.0 ARMv7 APK** (com.gameloft.android.ANMP.Gloft9MHM).
+- Extracted Gameloft SD data folder (Gloft9MHM).
+
+Copy the switch/ folder to the root of your SD card. Ensure the game files are placed according to the layout below:
+
+`	ext
+sd:/switch/9mm_nx/
+├── 9mm_nx.nro
+├── 9mm.apk
+└── gameloft/
+    └── games/
+        └── Gloft9MHM/
+            ├── *.gla
+            ├── sounds_hi.glza
+            ├── *.dat
+            └── ...
+`
+
+### First launch
+
+1. Open **sphaira** and locate **9mm** in Homebrew.
+2. Select **Install Forwarder**.
+3. Launch the game icon from the Switch **HOME menu**.
+4. On initial launch, the runtime extracts necessary native libraries from the APK and initializes local configurations.
+
+## Controls
+
+### Gameplay
+
+| Nintendo Switch | Input |
+| --- | --- |
+| **Left Stick** | Character movement (floating virtual joystick) |
+| **Right Stick** | Camera / look (continuous drag) |
+| **R / ZR** | Fire |
+| **L** | Bullet time |
+| **B** (held) | Sprint |
+| **Y** | Reload |
+| **+** | Pause / Game menu |
+| **D-Pad Left / Right** | Switch weapon (emulates horizontal swipe) |
+| **Touchscreen** | Native touch controls |
+
+### Cursor / Navigation
+
+- Move the **Right Stick** to control the camera view.
+- Press **R / ZR** to fire at the current aim position.
+- Button positions can be modified by creating config.ini inside /switch/9mm_nx/ (refer to source for control mapping options).
+
+## File Structure & Saves
+
+The application directory is located under sd:/switch/9mm_nx/:
+
+`	ext
+data/              Android internal storage and native saves
+gameloft/          Gameloft shared data (gameloft/games/Gloft9MHM/)
+sdcard/            Android external storage root
+config.ini         Custom control mapping overrides
+debug.log          Current execution log
+crash.log          Crash diagnostics output
+`
+
+## Building
+
+### Requirements
+
+- Docker with Linux container support.
+- [android32](https://github.com/aks796/android32) in untime/ (Git submodule).
+- [libnx32](https://github.com/aks796/libnx32) prefix (version 4.12.0 or newer).
+- [mesa32](https://github.com/aks796/mesa32) or mesa-switch32 in portlibs32/.
+- devkitPro devkita64 for launcher compilation.
+- A launcher icon at launcher/icon.jpg (256x256). Not included; use your own.
+
+### Build steps
+
+`powershell
+git submodule update --init --recursive
+.\build.ps1
+cd launcher; ./build.sh
+`
+
+The compiled binary will be located at launcher/9mm_nx.nro.
+
+## Known Issues
+
+- PVRTC is decoded on the CPU (about 0.9 ms per 512 KB level); loading screens cost time. PVRTC 2bpp is not decoded (grey).
+- SWP/SWPB ARMv5 instructions are emulated through an exception hook: correct but slow when the engine takes its locks frequently. A static patch of the sites is the next step if it shows.
+- The engine logs unbound parameter for the sampler uniforms of its world shaders; the rendering looks right, but the cause is not explained.
+- getKeyboardText returns NULL; there is no on-screen keyboard (name entry).
+- Online services, billing, Gameloft Live and DRM natives answer "nothing there".
+- Some leftovers of the original port this was started from remain in 
+m9_obb.c (OBB lookup, unused by this game).
 
 ## Credits
 
-* The Dark Knight Rises: Gameloft (the game; not included).
-* android32 runtime, libnx32, toolchain: aks796, vita2hos, devkitPro.
-* Mesa 3D, miniz: their authors (see their licenses).
-* Original `.so` loader work: Andy Nguyen (TheOfficialFloW), fgsfds.
-* Input/mapping patterns studied from the Ducktales-NX, Sonic All-Stars
-  Racing, TASM2, Modern Combat 3 and Asphalt 8 ports (Thorhax, aks796,
-  Rinnegatamante).
+- [aks796/android32](https://github.com/aks796/android32) — core AArch32 Android runtime.
+- [libnx32](https://github.com/aks796/libnx32) and Mesa Switch contributors — SDK and graphics stack.
+- [tasm2_nx](https://github.com/Muhilhammau/tasm2-nx) — documentation and structure reference.
+- [tintin_nx](https://github.com/muhilhammau/tintin-nx) — structure and README reference.
+- 9mm Vita port — reference for native call signatures and HUD positions of the controls.
+- Gameloft — original game developers and rights holders.
 
-## Disclaimer
+## License
 
-Unofficial fan project, not affiliated with Nintendo or Gameloft. No game
-code or data included: you need your own APK and data files.
-
-### A note on docked vs handheld play
-
-Docked play is fully playable, but some of the game's context actions
-cannot be mapped to physical buttons: they appear as large touch buttons
-placed by the game itself (QTE prompts, takedowns), and on a controller
-they are pressed through the centre crosshair (`ZR`). For that reason the
-game is considerably more enjoyable in handheld mode, where the touch
-screen does those actions directly.
+The port code is licensed under MIT (see LICENSE). Game assets and binaries remain the property of their respective owners.
