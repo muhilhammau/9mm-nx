@@ -1,0 +1,64 @@
+/* port_config.h -- 9mm (Gameloft, Android armeabi-v7a)
+ *
+ * Port settings for the android32 runtime.
+ *
+ * Folder on the SD card (PORT_ROOT_PATH = "/switch/" PORT_NAME):
+ *   sdmc:/switch/9mm_nx/
+ *     9mm_nx.nro       the launcher
+ *     <any name>.apk   the player's original game APK
+ *     config.ini, debug.log
+ *     libCopStory.so   unpacked game library (first start)
+ *     gameloft/games/Gloft9MHM/   the game's .gla/.glza data files
+ *
+ * MIT.
+ */
+
+#ifndef PORT_CONFIG_H
+#define PORT_CONFIG_H
+
+/* Game identity */
+#define PORT_TITLE   "9mm"
+#define PORT_NAME    "9mm_nx"
+
+/* Confirmed: AndroidManifest.xml and the Java_* symbol names of libCopStory. */
+#define PORT_PACKAGE "com.gameloft.android.ANMP.Gloft9MHM"
+
+#define PORT_BANNER \
+    "9mm NX: Gameloft engine, Android armeabi-v7a"
+
+/* APK configuration */
+#define PORT_APK_DEFAULT_NAME "9mm.apk"
+#define PORT_APK_DESC \
+    "9mm Gameloft (" PORT_PACKAGE ", armeabi-v7a)"
+
+/* libStormGLOFT.so IS needed: libCopStory.so has no unwinder or C++ runtime of
+ * its own and imports _Unwind_*, __gnu_unwind_frame, __aeabi_unwind_cpp_pr* and
+ * __aeabi_*div* from it (Java loads StormGLOFT first, then CopStory). */
+#define PORT_APK_ROLES \
+  {.what = "the game", .name = PORT_APK_DEFAULT_NAME, \
+   .need = (const char *const[]){ \
+       "lib/armeabi-v7a/libCopStory.so", \
+       "lib/armeabi-v7a/libStormGLOFT.so", \
+       NULL \
+   }, \
+   .package = PORT_PACKAGE}
+
+#define PORT_LAUNCHER_START_NOTE \
+    "(the first start unpacks the game's native library from the APK)"
+
+/* libCopStory.so: highest p_vaddr + p_memsz = 0xb5f410 (11.4 MiB). */
+#define PORT_SO_REGION_BYTES (16u * 1024 * 1024)
+
+/* Sequential archive streaming (.gla / .glza game assets). */
+#define RT_IO_READAHEAD      1
+#define RT_IO_PATTERN_STATS  1
+#define RT_STDIO_READ_BUF    32768
+
+/* Loading performance */
+#define RT_BOOST_WATCH_THREAD 1
+
+/* One-player game */
+#define RT_PAD_MAX_PLAYERS 1
+
+#endif /* PORT_CONFIG_H */
+

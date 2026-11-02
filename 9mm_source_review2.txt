@@ -1,0 +1,1414 @@
+===== FILE: source\nm9_audio.c =====
+/* nm9_audio.c -- android.media.AudioTrack on audout.
+ *
+ * The engine (Gameloft's "vox" mixer) mixes its sound itself and streams it
+ * to Java's AudioTrack: new AudioTrack(stream, rate, channels, format, size,
+ * mode), play(), then write(byte[], off, size) in a loop, which blocks while
+ * the track's buffer is full -- that is what paces the engine's audio thread.
+ * Here each track has a ring buffer; one pump thread (rt_audout_pump_start)
+ * mixes the playing tracks into audout's 48 kHz stereo buffers, resampling
+ * (nearest frame) from the track's rate. 16-bit PCM only, mono or stereo. MIT.
+ */
+#include <stdlib.h>
+#include <string.h>
+#include <switch.h>
+
+#include "rt_audout.h"
+#include "nm9.h"
+#include "util.h"
+
+#define MAX_TRACKS 4
+#define RING_BYTES (64 * 1024) /* power of two */
+
+typedef struct Track {
+  int used;
+  int rate, chans, playing, cur_ok;
+  uint32_t step, frac;      /* 16.16 source frames per output frame */
+  int16_t cur[2];
+  uint32_t rd, wr;          /* byte counters; RING_BYTES is a power of two */
+  uint8_t ring[RING_BYTES];
+} Track;
+
+static Mutex g_lock;
+static CondVar g_space;
+static Track *g_tracks[MAX_TRACKS];
+static Track g_pool[MAX_TRACKS]; /* never freed: a writer may still hold a released track */
+static int g_pump, g_paused;
+
+static int pop_frame(Track *t) {
+  uint32_t fb = (uint32_t)t->chans * 2;
+  if (t->wr - t->rd < fb)
+    return 0;
+  int16_t v[2];
+  for (int c = 0; c < t->chans; c++) {
+    uint8_t lo = t->ring[t->rd++ & (RING_BYTES - 1)];
+    uint8_t hi = t->ring[t->rd++ & (RING_BYTES - 1)];
+    v[c] = (int16_t)(lo | (hi << 8));
+  }
+  t->cur[0] = v[0];
+  t->cur[1] = t->chans > 1 ? v[1] : v[0];
+  return 1;
+}
+
+static void fill(int16_t *out, int frames, void *ud) {
+  (void)ud;
+  memset(out, 0, (size_t)frames * 4);
+  if (g_paused)
+    return;
+  mutexLock(&g_lock);
+  for (int i = 0; i < MAX_TRACKS; i++) {
+    Track *t = g_tracks[i];
+    if (!t || !t->playing)
+      continue;
+    for (int f = 0; f < frames; f++) {
+      if (!t->cur_ok && !(t->cur_ok = pop_frame(t)))
+        break; /* underrun: silence until the engine writes more */
+      int l = out[2 * f] + t->cur[0], r = out[2 * f + 1] + t->cur[1];
+      out[2 * f] = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l);
+      out[2 * f + 1] = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
+      t->frac += t->step;
+      while (t->frac >= 65536) {
+        t->frac -= 65536;
+        t->cur_ok = pop_frame(t);
+      }
+    }
+  }
+  condvarWakeAll(&g_space);
+  mutexUnlock(&g_lock);
+}
+
+void nm9_audio_pause(int paused) { g_paused = paused; }
+
+/* ----------------------------------------------------------------- Java */
+jvalue nm9_at_init(JObj *self, const jvalue *a, const JMethod *m) {
+  int rate = a[1].i > 0 ? a[1].i : 44100, cfg = a[2].i;
+  Track *t = NULL;
+  mutexLock(&g_lock);
+  for (int i = 0; i < MAX_TRACKS && !t; i++)
+    if (!g_pool[i].used) {
+      t = &g_pool[i];
+      memset(t, 0, sizeof *t);
+      t->used = 1;
+    }
+  mutexUnlock(&g_lock);
+  if (!t) {
+    debugPrintf("[audio] AudioTrack: no free track\n");
+    self->p = NULL;
+    return jv_none();
+  }
+  t->rate = rate;
+  t->chans = (cfg == 2 || cfg == 4) ? 1 : 2; /* CHANNEL_(OUT_)MONO; the rest stereo */
+  if (rt_audout_open() == 0 && !g_pump)
+    g_pump = rt_audout_pump_start(fill, NULL, 0x2A, 2) == 0;
+  t->step = (uint32_t)(((uint64_t)rate << 16) / rt_audout_rate());
+  mutexLock(&g_lock);
+  int placed = 0;
+  for (int i = 0; i < MAX_TRACKS && !placed; i++)
+    if (!g_tracks[i])
+      g_tracks[i] = t, placed = 1;
+  mutexUnlock(&g_lock);
+  if (!placed) {
+    t->used = 0;
+    t = NULL;
+  }
+  self->p = t;
+  debugPrintf("[audio] AudioTrack %d Hz, %d ch%s\n", rate, t ? t->chans : 0, placed ? "" : " (no free track)");
+  return jv_none();
+}
+
+jvalue nm9_at_min_buffer(JObj *self, const jvalue *a, const JMethod *m) {
+  int ch = (a[1].i == 2 || a[1].i == 4) ? 1 : 2;
+  return jv_i(a[0].i / 5 * ch * 2 & ~3); /* about 200 ms */
+}
+
+jvalue nm9_at_play(JObj *self, const jvalue *a, const JMethod *m) {
+  Track *t = self->p;
+  if (t)
+    t->playing = 1;
+  return jv_none();
+}
+
+jvalue nm9_at_pause(JObj *self, const jvalue *a, const JMethod *m) {
+  Track *t = self->p;
+  if (t)
+    t->playing = 0;
+  return jv_none();
+}
+
+jvalue nm9_at_stop(JObj *self, const jvalue *a, const JMethod *m) {
+  Track *t = self->p;
+  if (t) {
+    mutexLock(&g_lock);
+    t->playing = 0;
+    t->rd = t->wr = 0;
+    t->cur_ok = 0;
+    condvarWakeAll(&g_space);
+    mutexUnlock(&g_lock);
+  }
+  return jv_none();
+}
+
+jvalue nm9_at_release(JObj *self, const jvalue *a, const JMethod *m) {
+  Track *t = self->p;
+  if (!t)
+    return jv_none();
+  mutexLock(&g_lock);
+  t->playing = 0;
+  for (int i = 0; i < MAX_TRACKS; i++)
+    if (g_tracks[i] == t)
+      g_tracks[i] = NULL;
+  self->p = NULL;
+  condvarWakeAll(&g_space);
+  mutexUnlock(&g_lock);
+  svcSleepThread(30000000ll); /* a writer that was waiting leaves it first */
+  t->used = 0;
+  return jv_none();
+}
+
+jvalue nm9_at_write(JObj *self, const jvalue *a, const JMethod *m) {
+  Track *t = self->p;
+  JObj *arr = a[0].l;
+  int off = a[1].i, size = a[2].i;
+  if (!t || !arr || arr->kind != JK_ARRAY || off < 0 || size <= 0 || off + size > arr->a.len)
+    return jv_i(0);
+  if (!g_pump) { /* no sound output: take the data, at about the speed it would play */
+    svcSleepThread((int64_t)size * 1000000000ll / ((int64_t)t->rate * t->chans * 2));
+    return jv_i(size);
+  }
+  const uint8_t *src = (const uint8_t *)arr->a.data + off;
+  int done = 0;
+  mutexLock(&g_lock);
+  while (done < size) {
+    uint32_t space = RING_BYTES - (t->wr - t->rd);
+    if (!space) {
+      if (!t->playing)
+        break; /* a stopped (or released) track does not block */
+      condvarWaitTimeout(&g_space, &g_lock, 20000000ull);
+      continue;
+    }
+    uint32_t n = space < (uint32_t)(size - done) ? space : (uint32_t)(size - done);
+    /* two memcpy (the ring's end, then its start) instead of a byte loop: the
+     * A57's copy moves 16 bytes at a time */
+    uint32_t pos = t->wr & (RING_BYTES - 1), first = RING_BYTES - pos;
+    if (first > n)
+      first = n;
+    memcpy(t->ring + pos, src + done, first);
+    memcpy(t->ring, src + done + first, n - first);
+    t->wr += n;
+    done += (int)n;
+  }
+  mutexUnlock(&g_lock);
+  if (done < size)
+    svcSleepThread(5000000ll);
+  return jv_i(done);
+}
+
+jvalue nm9_at_state(JObj *self, const jvalue *a, const JMethod *m) {
+  Track *t = self->p;
+  return jv_i(t && t->playing ? 3 : 1); /* PLAYSTATE_PLAYING / _STOPPED */
+}
+
+jvalue nm9_at_native_rate(JObj *self, const jvalue *a, const JMethod *m) { return jv_i((jint)rt_audout_rate()); }
+
+
+===== FILE: source\nm9_config.c =====
+/* nm9_config.c -- config.ini's options, on the runtime's INI engine. MIT. */
+#include <stddef.h>
+
+#include "rt_cfg.h"
+
+static const CfgOpt k_opts[] = {
+    CFG_ROW_RESOLUTION("720", CFG_HELP_RESOLUTION),
+    {"display", "frame_rate", "60",
+     "Frames per second: 60, or 30 (the Switch's GPU and battery work half as hard,\n"
+     "# which helps in handheld mode; the game's own timing does not change).",
+     CFG_CHOICE, "60,30", NULL},
+    {"display", "show_fps", "false", "Log the frame rate every 2 seconds ([fps] in debug.log).",
+     CFG_BOOL, NULL, NULL},
+    {"display", "crosshair", "true", "A small centring crosshair in the middle of the screen (gameplay).",
+     CFG_BOOL, NULL, NULL},
+    {"performance", "boost_cpu_when_loading", "true",
+     "CPU at 1785 MHz inside loading frames (the launch, zone loads): a frame\n"
+     "# past 50 ms boosts until it ends (Horizon FastLoad, as retail loadings\n"
+     "# do). Gameplay frames never boost, so the Switch keeps stock clocks\n"
+     "# while playing.",
+     CFG_BOOL, NULL, NULL},
+    {"performance", "gpu_boost_handheld", "true",
+     "Handheld GPU at 460.8 MHz instead of 307.2 (an official handheld\n"
+     "# profile, as the Switch recomp ports use; CPU and MEM stay stock).\n"
+     "# Docked is untouched (768 MHz already).",
+     CFG_BOOL, NULL, NULL},
+    {"controls", "gamepad_keys", "true",
+     "The buttons act as Android keys in the menus: D-pad = arrows, + = Menu,\n"
+     "# - = Back (A/B send keys only while gamepad_touch is off).",
+     CFG_BOOL, NULL, NULL},
+    {"controls", "gamepad_touch", "true",
+     "The Joy-Cons drive the touch screen in gameplay: left stick = the virtual\n"
+     "# joystick, A/B/X/Y/L/R = taps on the right-side buttons. In the start\n"
+     "# menu there are no virtual fingers (keys + touch screen only), detected\n"
+     "# automatically from the loaded zone. 1280x720 pixels; tune if a tap misses.",
+     CFG_BOOL, NULL, NULL},
+    {"controls", "gamepad_native", "true",
+     "Native gamepad (Xperia slide + PowerA announced; SHIELD key codes and\n"
+     "# the right stick in the game's globals). Off: raw keys (Menu/Back)\n"
+     "# and swipe look instead.",
+     CFG_BOOL, NULL, NULL},
+    {"controls", "gamepad_invert_y", "true",
+     "Flip the right stick's vertical axis (on: pushing up looks down).",
+     CFG_BOOL, NULL, NULL},
+    {"controls", "touch_joy_x", "158", "Virtual joystick centre (left stick down).",
+     CFG_INT, NULL, NULL, 0, 0, 0, 0},
+    {"controls", "touch_joy_y", "585", "Virtual joystick centre (left stick down).",
+     CFG_INT, NULL, NULL, 0, 0, 0, 0},
+    {"controls", "touch_joy_r", "95", "Virtual joystick travel (left stick at full tilt).",
+     CFG_INT, NULL, NULL, 0, 0, 0, 0},
+    {"controls", "touch_btn_attack_x", "1150", "Attack button tap (B, R).", CFG_INT, NULL, NULL, 0,
+     0, 0, 0},
+    {"controls", "touch_btn_attack_y", "550", "Attack button tap (B, R).", CFG_INT, NULL, NULL, 0,
+     0, 0, 0},
+    {"controls", "touch_btn_jump_x", "1030", "Jump button tap (A, L).", CFG_INT, NULL, NULL, 0, 0,
+     0, 0},
+    {"controls", "touch_btn_jump_y", "610", "Jump button tap (A, L).", CFG_INT, NULL, NULL, 0, 0,
+     0, 0},
+    {"controls", "touch_btn_counter_x", "1150", "Counter button tap (X, ZR).", CFG_INT, NULL,
+     NULL, 0, 0, 0, 0},
+    {"controls", "touch_btn_counter_y", "420", "Counter button tap (X, ZR).", CFG_INT, NULL,
+     NULL, 0, 0, 0, 0},
+    {"controls", "touch_btn_use_x", "1030", "Interact button tap (Y, ZL).", CFG_INT, NULL, NULL, 0,
+     0, 0, 0},
+    {"controls", "touch_btn_use_y", "480", "Interact button tap (Y, ZL).", CFG_INT, NULL, NULL, 0,
+     0, 0, 0},
+    {"controls", "touch_btn_sneak_x", "1090", "Sneak button tap (L, estimates).", CFG_INT, NULL,
+     NULL, 0, 0, 0, 0},
+    {"controls", "touch_btn_sneak_y", "350", "Sneak button tap (L, estimates).", CFG_INT, NULL,
+     NULL, 0, 0, 0, 0},
+    {"controls", "touch_btn_grapnel_x", "1210", "Grapnel button tap (R, estimates).", CFG_INT, NULL,
+     NULL, 0, 0, 0, 0},
+    {"controls", "touch_btn_grapnel_y", "470", "Grapnel button tap (R, estimates).", CFG_INT, NULL,
+     NULL, 0, 0, 0, 0},
+    {"controls", "touch_btn_qte_x", "640", "Crosshair action tap (ZL: doors, windshield, QTE).",
+     CFG_INT, NULL, NULL, 0, 0, 0, 0},
+    {"controls", "touch_btn_qte_y", "360", "Crosshair action tap (ZL: doors, windshield, QTE).",
+     CFG_INT, NULL, NULL, 0, 0, 0, 0},
+    {"controls", "touch_btn_center_x", "640",
+     "Central-third general tap (ZR: its own point, not the crosshair's).",
+     CFG_INT, NULL, NULL, 0, 0, 0, 0},
+    {"controls", "touch_btn_center_y", "360",
+     "Central-third general tap (ZR: its own point, not the crosshair's).",
+     CFG_INT, NULL, NULL, 0, 0, 0, 0},
+    {"controls", "touch_drive_x", "640", "Driving slider centre (left stick X).", CFG_INT, NULL,
+     NULL, 0, 0, 0, 0},
+    {"controls", "touch_drive_y", "620", "Driving slider centre (left stick X).", CFG_INT, NULL,
+     NULL, 0, 0, 0, 0},
+    {"controls", "touch_drive_r", "180", "Driving slider travel at full tilt.", CFG_INT, NULL,
+     NULL, 0, 0, 0, 0},
+    {"controls", "touch_drive_toggle", "true",
+     "ZL + steered stick enters drive mode, any ZL tap leaves it (no holding).\n"
+     "# false: hold ZL to drive, as before.",
+     CFG_BOOL, NULL, NULL},
+    {"controls", "touch_cam_speed", "16", "Look speed: pixels per frame at full right-stick tilt.",
+     CFG_INT, NULL, NULL, 0, 0, 0, 0},
+    {"controls", "touch_cam_r", "120", "Look radius before the swipe finger ratchets back.",
+     CFG_INT, NULL, NULL, 0, 0, 0, 0},
+    CFG_ROW_GL_SELFTEST(NULL),
+    CFG_ROW_BOOT_LOG(CFG_HELP_BOOT_LOG, NULL),
+    CFG_ROW_LOG_JNI(CFG_HELP_LOG_JNI, NULL),
+};
+
+static const CfgMigrate k_migrate[] = {
+    /* Stock clocks from build 2 on: an existing config.ini holding true moves
+     * back to false. */
+    {"performance", "boost_cpu_when_loading", "true", "false", 2},
+    /* Inverted camera Y from build 3 on (a8retry/TASM2 negate it too). */
+    {"controls", "gamepad_invert_y", "false", "true", 3},
+    /* Raw menu keys from build 4 on: the native transfer remaps the D-pad
+     * and shop-like menus only answer the raw arrows. */
+    {"controls", "gamepad_native", "true", "false", 4},
+    /* Native back on from build 5: menus get Minus+R3 instead. */
+    {"controls", "gamepad_native", "false", "true", 5},
+    /* Real widget geometry from build 6 (gameswf_normalres.gla stream 1: the
+     * joystick sits at (118,520) of 960x640 = (158,585) of 1280x720 with a
+     * radius of 84 (~95); pushing forward used to leave it. The driving
+     * slider (podSlider) is 280 wide: full tilt must reach its ends. */
+    {"controls", "touch_joy_x", "170", "158", 6},
+    {"controls", "touch_joy_y", "540", "585", 6},
+    {"controls", "touch_joy_r", "90", "95", 6},
+    {"controls", "touch_drive_r", "120", "180", 6},
+    /* Load-only CPU boost from build 7 (Dead Space pattern). */
+    {"performance", "boost_cpu_when_loading", "false", "true", 7},
+    /* FPS counter off from build 8 (quiet log). */
+    {"display", "show_fps", "true", "false", 8},
+};
+
+static const CfgTable k_table = {
+    .opts = k_opts,
+    .nopts = CFG_COUNT(k_opts),
+    .migrate = k_migrate,
+    .nmigrate = CFG_COUNT(k_migrate),
+    .version = 8,
+};
+
+void dcr_config_load(void) { rt_config_load(&k_table); }
+
+===== FILE: source\nm9_gpu.c =====
+/* nm9_gpu.c -- the handheld GPU boost, as the Switch recomp ports do it.
+ *
+ * Handheld stock is GPU 307.2 MHz; 460.8 MHz is an official handheld profile
+ * (UnleashedRecomp-NX, sa2-nx: GPU up, MEM staying at 1331.2). CPU and MEM
+ * are untouched, and docked needs nothing (768 MHz already). The request
+ * lives in a clkrst session held for the run; undocking/docking (or the
+ * option) is followed by the frame loop's tick. [performance]
+ * gpu_boost_handheld disables it. MIT.
+ */
+#include <switch.h>
+
+#include "rt_cfg.h"
+#include "nm9.h"
+#include "util.h"
+
+#define GPU_HANDHELD_BOOST_HZ 460800000u
+
+static ClkrstSession g_clk;
+static int g_have, g_inited;
+static u32 g_saved;
+static int g_saved_ok;
+
+static int want(void) { return rt_config_value("performance.gpu_boost_handheld", 1); }
+
+void nm9_gpu_boost_apply(void) {
+  if (!want() || g_have)
+    return;
+  if (appletGetOperationMode() != AppletOperationMode_Handheld)
+    return;
+  if (!g_inited) {
+    g_inited = 1;
+    if (R_FAILED(clkrstInitialize())) {
+      debugPrintf("[gpu] no clkrst: stock GPU clocks\n");
+      return;
+    }
+  }
+  if (R_FAILED(clkrstOpenSession(&g_clk, PcvModuleId_GPU, 3))) {
+    debugPrintf("[gpu] GPU session failed: stock GPU clocks\n");
+    return;
+  }
+  u32 cur = 0;
+  if (R_SUCCEEDED(clkrstGetClockRate(&g_clk, &cur)) && cur >= GPU_HANDHELD_BOOST_HZ) {
+    debugPrintf("[gpu] handheld GPU already %u MHz: keeping it\n", (unsigned)(cur / 1000000));
+    clkrstCloseSession(&g_clk);
+    return;
+  }
+  g_saved = cur;
+  g_saved_ok = cur != 0;
+  if (R_FAILED(clkrstSetClockRate(&g_clk, GPU_HANDHELD_BOOST_HZ))) {
+    debugPrintf("[gpu] GPU 460.8 MHz refused: stock GPU clocks\n");
+    clkrstCloseSession(&g_clk);
+    return;
+  }
+  g_have = 1;
+  debugPrintf("[gpu] handheld GPU %u -> 460.8 MHz (CPU/MEM stock)\n", (unsigned)(cur / 1000000));
+}
+
+void nm9_gpu_boost_remove(void) {
+  if (!g_have)
+    return;
+  g_have = 0;
+  if (g_saved_ok)
+    clkrstSetClockRate(&g_clk, g_saved);
+  clkrstCloseSession(&g_clk);
+  debugPrintf("[gpu] GPU boost off\n");
+}
+
+void nm9_gpu_boost_tick(void) {
+  if (!want()) {
+    nm9_gpu_boost_remove();
+    return;
+  }
+  if (appletGetOperationMode() == AppletOperationMode_Handheld)
+    nm9_gpu_boost_apply();
+  else
+    nm9_gpu_boost_remove();
+}
+
+===== FILE: source\nm9_input.c =====
+/* nm9_input.c -- the Switch's inputs for the engine.
+ *
+ * The game is played on a touch screen; the Joy-Cons drive it through the
+ * reusable touchmap module (touchmap.h): the left stick or D-pad drags the
+ * virtual joystick (STICK_WALK_*), the right stick looks through the game's
+ * own PowerA globals (STICK_ROTATE_*), and every button taps a right-side
+ * control and/or sends an Android key. Positions are 1280x720 config.ini
+ * values (see nm9_config.c); the real touch screen shares the same finger
+ * pool. The D-pad is arrows (the original's cruceta movement) in menus and
+ * gameplay; the left stick holds those same arrows 8-way, plus the drag.
+ *
+ * Menu vs gameplay is automatic, as in the Dead Space port: the wrapper sees
+ * which zone the engine opened (nm9_obb.c: l_menu is the start menu, every
+ * other l_* zone is Gotham), plus pause panels inside gameplay zones (Plus
+ * opens one, B goes back, a deflected stick means gameplay again). Where no
+ * full mapping runs there are no virtual fingers at all -- keys plus the
+ * touch screen -- so sticks and D-pad can never land on menu buttons (the
+ * tech shop). Driving is its own independent modal: holding ZL turns the left stick's X into the slider
+ * drag (walk and ride never fight: while held the stick stops driving the
+ * joystick). MIT.
+ */
+#include <math.h>
+#include <string.h>
+#include <switch.h>
+
+#include "rt_cfg.h"
+#include "rt_applet.h"
+#include "rt_pad.h"
+#include "rt_window.h"
+#include "nm9.h"
+#include "touchmap.h"
+#include "util.h"
+
+static u64 g_prev;
+static TmPad g_tm;
+static TmBind g_binds[28];
+static u32 g_seen[16];
+static int g_nseen;
+static int g_keylog;
+static int g_invert_y;
+static int g_drive_x, g_drive_y, g_drive_r, g_drive_on;
+static int g_drive_toggle = 1, g_drive_latch;
+static int g_ctr_x = 640, g_ctr_y = 360; /* central-third point (ZR) */
+static u64 g_zr_rep_t;
+static int g_zr_rep_on;
+static u64 g_skeys;
+static int g_applied = 1; /* tables currently loaded: 1 keys-only, 0 full */
+static int g_paused;      /* pause/menu panel open inside a gameplay zone */
+#define VDRIVE_KEY 0x80000030u
+#define VZRREP_KEY 0x80000031u
+
+static void build_binds(int nomove);
+
+static void input_sampler(void *arg);
+
+static void tm_touch(int action, int x, int y, int id) {
+  if (g_nat.touchEvent)
+    g_nat.touchEvent(g_jni_env, g_lib_cls, action, x, y, id);
+}
+
+static void tm_key(int keycode, int down) {
+  if (g_keylog < 100) {
+    g_keylog++;
+    debugPrintf("[input] key %d %s\n", keycode, down ? "down" : "up");
+  }
+  if (down && g_nat.onKeyDown)
+    g_nat.onKeyDown(g_jni_env, g_lib_cls, keycode);
+  if (!down && g_nat.onKeyUp)
+    g_nat.onKeyUp(g_jni_env, g_lib_cls, keycode);
+}
+
+void nm9_input_init(void) {
+  hidInitializeTouchScreen();
+  rt_pad_setup(1, 1);
+  /* NOTE: no pad state here; the sampler thread owns the only PadState, so
+   * slow frames never lose edges (see input_sampler). */
+  tm_init(tm_touch, tm_key);
+  g_applied = nm9_zone_is_menu();
+  g_paused = 0;
+  build_binds(g_applied);
+  static Thread s_sampler;
+  if (R_FAILED(threadCreate(&s_sampler, input_sampler, NULL, NULL, 0x4000, 0x30, -2)) ||
+      R_FAILED(threadStart(&s_sampler)))
+    debugPrintf("[input] no sampler thread: quick taps may be lost in slow frames\n");
+}
+
+static void build_binds(int nomove) {
+  int touch = rt_config_value("controls.gamepad_touch", 1);
+  int keys = rt_config_bool("controls", "gamepad_keys");
+  g_invert_y = rt_config_value("controls.gamepad_invert_y", 1);
+  int ax = rt_config_value("controls.touch_btn_attack_x", 1150);
+  int ay = rt_config_value("controls.touch_btn_attack_y", 550);
+  int jx = rt_config_value("controls.touch_btn_jump_x", 1030);
+  int jy = rt_config_value("controls.touch_btn_jump_y", 610);
+  int cx = rt_config_value("controls.touch_btn_counter_x", 1150);
+  int cy = rt_config_value("controls.touch_btn_counter_y", 420);
+  int ux = rt_config_value("controls.touch_btn_use_x", 1030);
+  int uy = rt_config_value("controls.touch_btn_use_y", 480);
+  int sx = rt_config_value("controls.touch_btn_sneak_x", 1090);
+  int sy = rt_config_value("controls.touch_btn_sneak_y", 350);
+  int gx = rt_config_value("controls.touch_btn_grapnel_x", 1210);
+  int gy = rt_config_value("controls.touch_btn_grapnel_y", 470);
+  int qx = rt_config_value("controls.touch_btn_qte_x", 640);
+  int qy = rt_config_value("controls.touch_btn_qte_y", 360);
+  int zx = rt_config_value("controls.touch_btn_center_x", 640);
+  int zy = rt_config_value("controls.touch_btn_center_y", 360);
+  g_ctr_x = zx;
+  g_ctr_y = zy;
+  g_drive_x = rt_config_value("controls.touch_drive_x", 640);
+  g_drive_y = rt_config_value("controls.touch_drive_y", 620);
+  g_drive_r = rt_config_value("controls.touch_drive_r", 180);
+  g_drive_toggle = rt_config_value("controls.touch_drive_toggle", 1);
+
+  /* One table, same order in menu and gameplay (held buttons survive the
+   * switch): movement and menu arrows as keys, gameplay taps only on
+   * A/B/X/Y/L/R/ZR, the rest key-only. Button -> touch icon from the game's
+   * own prompts (strings.gla: "press the X button to attack", "tap the
+   * counterattack icon or press Triangle (= Y) to block", "tap the jump
+   * icon" for A, "right trigger" for the grapnel gun): X attacks, Y
+   * counters, R taps the grapnel, ZR alone presses the centred giant-circle
+   * button (QTE spam, doors, takedowns: placed at runtime, harmless when
+   * hidden). Native mode uses SHIELD codes
+   * (A96 B97 X99 Y100 L102 R103 ZL104 ZR105 StickL106 StickR107 Plus108
+   * Minus4 D-pad 19-22; A also 23 to confirm menus, B also 4 to go back in
+   * menus). In the menu there are no taps at all: keys plus the touch
+   * screen, so no finger can land on menu buttons. */
+  int native = g_nm9_native_pad;
+  int n = 0;
+  int tap = touch && !nomove; /* gameplay taps */
+  g_binds[n++] = (TmBind){HidNpadButton_Up, -1, -1, keys ? 19 : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_Down, -1, -1, keys ? 20 : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_Left, -1, -1, keys ? 21 : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_Right, -1, -1, keys ? 22 : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_Plus, -1, -1, keys ? (native ? 108 : 82) : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_Minus, -1, -1, keys ? 4 : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_A, tap ? jx : -1, tap ? jy : -1, keys ? (native ? 96 : 23) : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_A, -1, -1, keys ? 23 : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_B, tap ? ax : -1, tap ? ay : -1, keys ? (native ? 97 : 4) : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_X, tap ? ax : -1, tap ? ay : -1, keys ? (native ? 99 : -1) : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_Y, tap ? cx : -1, tap ? cy : -1, keys ? (native ? 100 : -1) : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_L, tap ? sx : -1, tap ? sy : -1, keys ? (native ? 102 : -1) : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_R, tap ? gx : -1, tap ? gy : -1, keys ? (native ? 103 : -1) : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_ZL, tap ? qx : -1, tap ? qy : -1, keys ? (native ? 104 : -1) : -1};
+  /* ZR is the central third's general tap: its own point (touch_btn_center_*),
+   * not the crosshair's. Dedicated, so no other button's tap conflicts. */
+  g_binds[n++] = (TmBind){HidNpadButton_ZR, tap ? zx : -1, tap ? zy : -1, keys ? (native ? 105 : -1) : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_StickL, -1, -1, keys ? (native ? 106 : -1) : -1};
+  g_binds[n++] = (TmBind){HidNpadButton_StickR, -1, -1, keys ? (native ? 107 : -1) : -1};
+  /* Y's second finger: the use/interact icon (context talks, hacks and
+   * pickups share the InteractButton slot with the counter prompt family). */
+  g_binds[n++] = (TmBind){HidNpadButton_Y, tap ? ux : -1, tap ? uy : -1, -1};
+  if (nomove)
+    g_binds[n++] = (TmBind){HidNpadButton_B, -1, -1, keys ? 4 : -1}; /* menu back */
+  g_tm.enable = touch || keys;
+  /* No virtual fingers in the menu (keys + touch screen only). */
+  g_tm.touch = touch && !nomove;
+  g_tm.cam_touch = touch && !nomove && !native;
+  g_tm.joy_x = rt_config_value("controls.touch_joy_x", 170);
+  g_tm.joy_y = rt_config_value("controls.touch_joy_y", 540);
+  g_tm.joy_r = rt_config_value("controls.touch_joy_r", 90);
+  g_tm.cam_speed = rt_config_value("controls.touch_cam_speed", 16);
+  g_tm.cam_r = rt_config_value("controls.touch_cam_r", 120);
+  g_tm.binds = g_binds;
+  g_tm.nbinds = n;
+  tm_pad_config(&g_tm);
+  debugPrintf("[input] touchEvent=%p vtouch=%d keys=%d native=%d nomove=%d binds=%d joy=(%d,%d,r%d)\n",
+              (void *)g_nat.touchEvent, touch, keys, g_nm9_native_pad, nomove, n, g_tm.joy_x,
+              g_tm.joy_y, g_tm.joy_r);
+}
+
+void nm9_input_refresh(void) { build_binds(g_applied); }
+
+/* A 120 Hz sampler: quick taps between two slow frames would otherwise never
+ * exist (edges computed from one poll to the next miss press+release). The
+ * snapshots carry pad + touchscreen state; poll() replays them in order, so
+ * every transition reaches the engine. No JNI here, ever. */
+#define SNAP_RING 128
+typedef struct {
+  u64 buttons;
+  float sticks[4];
+  u8 nt;
+  u32 tid[10];
+  s32 tx[10], ty[10];
+} Snap;
+static Snap g_ring[SNAP_RING];
+static volatile uint32_t g_head, g_tail;
+static PadState g_thread_pad;
+
+static void input_sampler(void *arg) {
+  (void)arg;
+  padInitializeDefault(&g_thread_pad);
+  u64 quiet_since = armGetSystemTick();
+  for (;;) {
+    if (rt_focused()) {
+      padUpdate(&g_thread_pad);
+      float sticks[4] = {0, 0, 0, 0};
+      u64 b = rt_pad_read(&g_thread_pad, sticks);
+      HidTouchScreenState st;
+      memset(&st, 0, sizeof st);
+      hidGetTouchScreenStates(&st, 1);
+      int active = b || st.count;
+      for (int i = 0; !active && i < 4; i++)
+        if (sticks[i] > 0.05f || sticks[i] < -0.05f)
+          active = 1;
+      u64 now = armGetSystemTick();
+      /* Idle 5 s: sample at ~33 Hz instead of 120 Hz (battery/heat), still
+       * quick to wake on the first input. */
+      if (active)
+        quiet_since = now;
+      else if (armTicksToNs(now - quiet_since) > 5000000000ull) {
+        svcSleepThread(30000000ll);
+        continue;
+      }
+      uint32_t h = __atomic_load_n(&g_head, __ATOMIC_RELAXED);
+      uint32_t nn = (h + 1) & (SNAP_RING - 1);
+      if (nn != __atomic_load_n(&g_tail, __ATOMIC_ACQUIRE)) {
+        Snap *s = &g_ring[h];
+        s->buttons = b;
+        memcpy(s->sticks, sticks, sizeof sticks);
+        s->nt = st.count > 10 ? 10 : (u8)st.count;
+        for (int i = 0; i < s->nt; i++) {
+          s->tid[i] = st.touches[i].finger_id;
+          s->tx[i] = st.touches[i].x;
+          s->ty[i] = st.touches[i].y;
+        }
+        __atomic_store_n(&g_head, nn, __ATOMIC_RELEASE);
+      }
+    }
+    svcSleepThread(8000000ll);
+  }
+}
+
+static void touches_from(const Snap *s, int w, int h) {
+  u32 cur[16];
+  int ncur = 0;
+  for (int i = 0; i < s->nt && ncur < 16; i++) {
+    int x = (int)((u64)(uint32_t)s->tx[i] * (u64)w / 1280);
+    int y = (int)((u64)(uint32_t)s->ty[i] * (u64)h / 720);
+    tm_move(s->tid[i], x, y);
+    cur[ncur++] = s->tid[i];
+    /* A fresh real finger in the pause corner (top-left 150x150, where the
+     * pause button lives): the pause menu was opened by touch. Only while
+     * the full mapping runs; the next snapshot switches tables. */
+    if (!g_paused && !g_applied) {
+      int was = 0;
+      for (int k = 0; k < g_nseen; k++)
+        if (g_seen[k] == s->tid[i])
+          was = 1;
+      if (!was && s->tx[i] < 150 && s->ty[i] < 150)
+        g_paused = 1;
+    }
+  }
+  for (int k = 0; k < g_nseen; k++) {
+    int gone = 1;
+    for (int i = 0; i < ncur; i++)
+      if (cur[i] == g_seen[k])
+        gone = 0;
+    if (gone)
+      tm_up(g_seen[k]);
+  }
+  memcpy(g_seen, cur, sizeof(u32) * (size_t)ncur);
+  g_nseen = ncur;
+}
+
+void nm9_input_poll(void) {
+  int w = 1280, h = 720;
+  dcr_window_size(&w, &h);
+  /* Replay snapshots in order (no edge lost); collapse runs of identical
+   * ones (idle menus) into their last: same edges, one processing. */
+  for (;;) {
+    uint32_t t = __atomic_load_n(&g_tail, __ATOMIC_RELAXED);
+    if (t == __atomic_load_n(&g_head, __ATOMIC_ACQUIRE))
+      break;
+    uint32_t last = t;
+    for (;;) {
+      uint32_t nx = (last + 1) & (SNAP_RING - 1);
+      if (nx == __atomic_load_n(&g_head, __ATOMIC_ACQUIRE))
+        break;
+      const Snap *a = &g_ring[last], *b = &g_ring[nx];
+      if (a->buttons != b->buttons || a->nt != b->nt ||
+          memcmp(a->sticks, b->sticks, sizeof a->sticks) != 0)
+        break;
+      int same = 1;
+      for (int i = 0; i < a->nt; i++)
+        if (a->tid[i] != b->tid[i] || a->tx[i] != b->tx[i] || a->ty[i] != b->ty[i]) {
+          same = 0;
+          break;
+        }
+      if (!same)
+        break;
+      last = nx;
+    }
+    const Snap *s = &g_ring[last];
+    u64 now = s->buttons;
+    u64 down = now & ~g_prev, up = g_prev & ~now;
+    g_prev = now;
+    touches_from(s, w, h);
+    /* Menu vs gameplay, as the wrapper sees it: the zone (l_menu is the
+     * start menu) plus pause panels inside gameplay zones (Plus opens the
+     * pause menu, Minus opens panels, B goes back, a deflected stick means
+     * the player wants to move). On a change, lift everything the other
+     * side held (Dead Space pattern), then switch tables. Held pad buttons
+     * stay held (no new edges); the synthetic stick arrows are released
+     * explicitly. A confirming a menu entry never switches: submenus stay
+     * finger-free too. */
+    {
+      if (down & HidNpadButton_Plus)
+        g_paused = 1;
+      if (down & HidNpadButton_Minus)
+        g_paused = 1;
+      if (down & HidNpadButton_B)
+        g_paused = 0;
+      {
+        float ex = s->sticks[0] < 0 ? -s->sticks[0] : s->sticks[0];
+        float ey = s->sticks[1] < 0 ? -s->sticks[1] : s->sticks[1];
+        if (ex > 0.5f || ey > 0.5f)
+          g_paused = 0;
+      }
+      int nomove = nm9_zone_is_menu() || g_paused;
+      if (nomove != g_applied) {
+        g_applied = nomove;
+        tm_pad_reset();
+        g_drive_latch = 0;
+        if (g_zr_rep_on) {
+          g_zr_rep_on = 0;
+          tm_up(VZRREP_KEY);
+        }
+        if (g_drive_on) {
+          g_drive_on = 0;
+          tm_up(VDRIVE_KEY);
+        }
+        if (g_skeys) {
+          if (g_skeys & HidNpadButton_Up)
+            tm_key(19, 0);
+          if (g_skeys & HidNpadButton_Down)
+            tm_key(20, 0);
+          if (g_skeys & HidNpadButton_Left)
+            tm_key(21, 0);
+          if (g_skeys & HidNpadButton_Right)
+            tm_key(22, 0);
+          g_skeys = 0;
+        }
+        build_binds(nomove);
+        debugPrintf("[input] %s\n", nomove ? (g_paused ? "pause panel: keys + touch screen, no virtual fingers"
+                                                       : "menu: keys + touch screen, no virtual fingers")
+                                           : "gameplay: full mapping (stick, camera, taps, drive)");
+      }
+    }
+    /* Driving (slider bar) is a latch: ZL + steered stick enters it, any ZL
+     * tap leaves it (or hold ZL the whole time with touch_drive_toggle=false).
+     * Entry needs the stick deflected so plain ZL taps (the central-third
+     * general tap, gadget key) never engage it by accident. In drive mode the
+     * left stick's X steers the slider with a gentle expo curve instead of
+     * the joystick, so the two fingers never fight; the slider finger stays
+     * put (no engage/release flicker). */
+    if (g_drive_toggle && (down & HidNpadButton_ZL)) {
+      float ex = s->sticks[0] < 0 ? -s->sticks[0] : s->sticks[0];
+      /* Entry needs the stick steered (a plain ZL tap is the central-third
+       * action); any tap while latched leaves it. */
+      if (g_drive_latch || ex >= 0.3f) {
+        g_drive_latch = !g_drive_latch;
+        debugPrintf("[input] drive mode %s\n", g_drive_latch ? "on (ZL to leave)" : "off");
+        if (!g_drive_latch && g_drive_on) {
+          g_drive_on = 0;
+          tm_up(VDRIVE_KEY);
+        }
+      }
+    }
+    int drive = (g_drive_toggle ? g_drive_latch : (now & HidNpadButton_ZL) != 0) && g_tm.touch;
+    float dsticks[4] = {drive ? 0.0f : s->sticks[0], drive ? 0.0f : s->sticks[1], s->sticks[2],
+                        s->sticks[3]};
+    tm_pad_poll(now, down, up, dsticks, w, h);
+    if (g_nm9_native_pad)
+      nm9_gamepad_stick(s->sticks[2], g_invert_y ? -s->sticks[3] : s->sticks[3]);
+    {
+      /* Expo steering: dead centre, fine near the middle, full throw at the
+       * ends (the slider bar is wide: linearity weaves). */
+      float lx = s->sticks[0];
+      float ax = lx < 0 ? -lx : lx;
+      float steer = 0.0f;
+      if (ax > 0.08f) {
+        float m = (ax - 0.08f) / 0.92f;
+        steer = (lx < 0 ? -1.0f : 1.0f) * (m * m * 0.65f + m * 0.35f);
+      }
+      if ((!drive || !g_tm.touch) && g_drive_on) {
+        g_drive_on = 0;
+        tm_up(VDRIVE_KEY);
+      }
+      if (!g_drive_on && drive && g_tm.touch) {
+        g_drive_on = 1;
+        tm_down(VDRIVE_KEY, g_drive_x * w / 1280, g_drive_y * h / 720);
+      }
+      if (g_drive_on) {
+        int r = g_drive_r < 20 ? 20 : g_drive_r;
+        tm_move(VDRIVE_KEY, g_drive_x * w / 1280 + (int)(steer * r * w / 1280), g_drive_y * h / 720);
+      }
+    }
+    /* The stick also holds the arrows in 8 directions, like the D-pad.
+     * Magnitude-based (not per-axis): diagonals count too. Engage past 0.45
+     * with 0.25 per axis, hold through the band, release below 0.30. */
+    {
+      float lx = s->sticks[0], ly = s->sticks[1];
+      float mag = sqrtf(lx * lx + ly * ly);
+      u64 want;
+      if (mag > 0.45f) {
+        want = 0;
+        if (lx > 0.25f)
+          want |= HidNpadButton_Right;
+        else if (lx < -0.25f)
+          want |= HidNpadButton_Left;
+        if (ly > 0.25f)
+          want |= HidNpadButton_Up;
+        else if (ly < -0.25f)
+          want |= HidNpadButton_Down;
+      } else if (mag < 0.30f) {
+        want = 0;
+      } else {
+        want = g_skeys; /* hysteresis band: keep holding */
+      }
+      /* The physical D-pad already sends its own keys: don't double them. */
+      want &= ~(now & (HidNpadButton_Up | HidNpadButton_Down | HidNpadButton_Left | HidNpadButton_Right));
+      u64 got = want & ~g_skeys, lost = g_skeys & ~want;
+      g_skeys = want;
+      if (got & HidNpadButton_Up)
+        tm_key(19, 1);
+      if (got & HidNpadButton_Down)
+        tm_key(20, 1);
+      if (got & HidNpadButton_Left)
+        tm_key(21, 1);
+      if (got & HidNpadButton_Right)
+        tm_key(22, 1);
+      if (lost & HidNpadButton_Up)
+        tm_key(19, 0);
+      if (lost & HidNpadButton_Down)
+        tm_key(20, 0);
+      if (lost & HidNpadButton_Left)
+        tm_key(21, 0);
+      if (lost & HidNpadButton_Right)
+        tm_key(22, 0);
+    }
+    /* ZR held: auto-mash the central third (doors, QTE spam). The bind taps
+     * once on the edge; holding repeats every 100 ms until let go. */
+    {
+      int zr = (now & HidNpadButton_ZR) != 0 && g_tm.touch;
+      u64 t = armGetSystemTick();
+      if (!zr) {
+        g_zr_rep_t = 0;
+        if (g_zr_rep_on) {
+          g_zr_rep_on = 0;
+          tm_up(VZRREP_KEY);
+        }
+      } else if (!g_zr_rep_t) {
+        g_zr_rep_t = t;
+      } else if (armTicksToNs(t - g_zr_rep_t) >= 100000000ull) {
+        g_zr_rep_t = t;
+        if (g_zr_rep_on)
+          tm_up(VZRREP_KEY);
+        g_zr_rep_on = 1;
+        tm_down(VZRREP_KEY, g_ctr_x * w / 1280, g_ctr_y * h / 720);
+      }
+    }
+    __atomic_store_n(&g_tail, (last + 1) & (SNAP_RING - 1), __ATOMIC_RELEASE);
+  }
+}
+
+===== FILE: source\nm9_obb.c =====
+/* nm9_obb.c -- the expansion files, read from <game folder>/obb.
+ *
+ * The game looks for its data (datakrhm.obb, and the patch, patchkrhm.obb)
+ * through Java (sGetOBBFilename) and, by name, in its own folders. Whatever
+ * it asks for ends in the player's obb folder: the runtime already sends
+ * /sdcard/Android/obb/<package>/... there (dcr_path.c); port_path_fixup
+ * covers the rest -- an .obb that is not there under that name (the player
+ * kept Google's main.<n>.<package>.obb, the game asks for datakrhm.obb, or
+ * the other way round) is answered with the file of the same role. A file
+ * that does exist under the name asked for is never replaced.
+ * Without any .obb (extracted 'files' tree in data/files instead), the
+ * engine still asks for data under obb/ (its res dir): obb/<...> falls back
+ * to data/files/<...> when that exists. MIT.
+ */
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+
+#include "dcr_path.h"
+#include "nm9.h"
+#include "nm9_obb_scan.h"
+#include "util.h"
+
+int nm9_obb_find(int patch, char *out, size_t cap) {
+  char dir[DCR_PATH_MAX];
+  snprintf(dir, sizeof dir, "%s/obb", dcr_game_root());
+  return nm9_obb_scan(dir, patch, out, cap);
+}
+
+/* Menu vs gameplay, seen by the wrapper: the engine opens its zones as
+ * l_<name>.gla (l_menu, l_gothamcity, l_batcave, ...). l_menu is the start
+ * menu (and its shop); every other l_* zone is gameplay. l_#blank (loading
+ * placeholder) and non-zone files keep whatever was there. Boot starts in
+ * the menu, so the stick never drags a finger over menu buttons. */
+static volatile int g_zone_menu = 1;
+
+void nm9_zone_note(const char *path) {
+  if (!path)
+    return;
+  const char *base = strrchr(path, '/');
+  base = base ? base + 1 : path;
+  if (strncasecmp(base, "l_", 2) != 0)
+    return;
+  size_t l = strlen(base);
+  if (l < 5)
+    return;
+  if (strcasecmp(base + l - 4, ".gla") != 0)
+    return;
+  if (!strncasecmp(base, "l_menu", 6)) {
+    if (!g_zone_menu)
+      debugPrintf("[zone] menu (%s): keys + touch screen\n", base);
+    g_zone_menu = 1;
+  } else if (!strncasecmp(base, "l_#blank", 8)) {
+    /* loading placeholder: keep the current side */
+  } else {
+    if (g_zone_menu)
+      debugPrintf("[zone] gameplay (%s): full mapping\n", base);
+    g_zone_menu = 0;
+  }
+}
+
+int nm9_zone_is_menu(void) { return g_zone_menu; }
+
+/* Trace the game's data opens (limited): .gla zones/textures and the OBB.
+ * The runtime's default only traces the APK; without this the zone streaming
+ * crash leaves no [io]/[path] lines at all. */
+int dcr_path_traced(const char *p) {
+  if (!p)
+    return 0;
+  return strstr(p, ".apk") || strstr(p, ".gla") || strstr(p, ".obb") || strstr(p, "textures") ||
+         strstr(p, "welcome") != NULL;
+}
+
+const char *port_path_fixup(const char *real, char *out, size_t cap) {
+  nm9_zone_note(real);
+  /* Path answers are stable for the run (the OBB set and the extracted tree
+   * do not move), but the engine re-asks dozens of times a frame: a 32-entry
+   * LRU skips the string matching and the stat()s on a hit. */
+  #define FIXUP_CACHE 32
+  static struct {
+    char req[DCR_PATH_MAX];
+    char ans[DCR_PATH_MAX];
+    int same; /* answer is the request itself */
+    int has;
+  } g_fixcache[FIXUP_CACHE];
+  static unsigned g_fixnext;
+  for (int i = 0; i < FIXUP_CACHE; i++)
+    if (g_fixcache[i].has && !strcmp(g_fixcache[i].req, real)) {
+      if (g_fixcache[i].same)
+        return real;
+      snprintf(out, cap, "%s", g_fixcache[i].ans);
+      return out;
+    }
+  /* Too long to key safely: answer without caching. */
+  size_t rlen = strlen(real);
+  int cacheable = rlen < sizeof g_fixcache[0].req;
+  char fixed[DCR_PATH_MAX];
+  int is_fixed = 0;
+  /* No-OBB installs keep the extracted tree in data/files (data/, textures/,
+   * welcome/...) while the engine asks for it under obb/ (its res dir). Send
+   * obb/<...> to data/files/<...> when that is what exists. .obb files
+   * themselves are handled below and never redirected. */
+  {
+    char obb[DCR_PATH_MAX];
+    snprintf(obb, sizeof obb, "%s/obb/", dcr_game_root());
+    size_t n = strlen(obb);
+    if (!strncmp(real, obb, n)) {
+      struct stat st;
+      if (stat(real, &st) != 0) {
+        char alt[DCR_PATH_MAX];
+        snprintf(alt, sizeof alt, "%s/data/files/%s", dcr_game_root(), real + n);
+        if (stat(alt, &st) == 0) {
+          static int logged_alt;
+          if (!logged_alt++)
+            debugPrintf("[obb] %s -> %s (extracted data)\n", real, alt);
+          snprintf(fixed, sizeof fixed, "%s", alt);
+          is_fixed = 1;
+        }
+      }
+    }
+  }
+  if (!is_fixed) {
+    size_t l = strlen(real);
+    if (l < 5 || strcasecmp(real + l - 4, ".obb")) {
+      /* unchanged */
+    } else {
+      struct stat st;
+      if (stat(real, &st) != 0) {
+        const char *base = strrchr(real, '/');
+        base = base ? base + 1 : real;
+        int patch = strncasecmp(base, "patch", 5) == 0;
+        char found[DCR_PATH_MAX];
+        if (nm9_obb_find(patch, found, sizeof found)) {
+          static int logged[2];
+          if (!logged[patch]++)
+            debugPrintf("[obb] %s -> %s\n", real, found);
+          snprintf(fixed, sizeof fixed, "%s", found);
+          is_fixed = 1;
+        }
+      }
+    }
+  }
+  {
+    unsigned slot = g_fixnext++ % FIXUP_CACHE;
+    if (cacheable) {
+      memcpy(g_fixcache[slot].req, real, rlen + 1);
+      g_fixcache[slot].same = !is_fixed;
+      if (is_fixed)
+        memcpy(g_fixcache[slot].ans, fixed, strlen(fixed) + 1);
+      g_fixcache[slot].has = 1;
+    }
+  }
+  if (!is_fixed)
+    return real;
+  snprintf(out, cap, "%s", fixed);
+  return out;
+}
+
+===== FILE: source\nm9_obb_scan.h =====
+/* nm9_obb_scan.h -- which file in the obb folder is the main / the patch
+ * expansion file, whatever the player called it. Shared by the game program
+ * (nm9_obb.c) and the launcher (launcher/source/nm9_launcher.c): plain
+ * libc, no libnx. MIT.
+ *
+ * The game's own names are datakrhm.obb and patchkrhm.obb; Google's are
+ * main.<version>.<package>.obb and patch.<version>.<package>.obb. A name
+ * starting with "patch" is the patch; any other .obb is the main file. Of
+ * several, the exact game name wins, else the last by name (the newest
+ * version).
+ */
+#ifndef nm9_OBB_SCAN_H
+#define nm9_OBB_SCAN_H
+
+#include <dirent.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+
+static inline int nm9_obb_exact(const char *n) {
+  return !strcasecmp(n, "datakrhm.obb") || !strcasecmp(n, "patchkrhm.obb");
+}
+
+/* 1 and dir/<name> in out when the folder has the file for the role. */
+static inline int nm9_obb_scan(const char *dir, int patch, char *out, size_t cap) {
+  DIR *d = opendir(dir);
+  if (!d)
+    return 0;
+  char best[256] = "";
+  struct dirent *e;
+  while ((e = readdir(d))) {
+    const char *n = e->d_name;
+    size_t l = strlen(n);
+    if (l < 5 || l >= sizeof best || n[0] == '.' || strcasecmp(n + l - 4, ".obb"))
+      continue;
+    if ((strncasecmp(n, "patch", 5) == 0) != (patch != 0))
+      continue;
+    if (!best[0] || nm9_obb_exact(n) || (!nm9_obb_exact(best) && strcmp(n, best) > 0))
+      memcpy(best, n, l + 1);
+  }
+  closedir(d);
+  if (!best[0])
+    return 0;
+  snprintf(out, cap, "%s/%s", dir, best);
+  return 1;
+}
+
+#endif /* nm9_OBB_SCAN_H */
+
+===== FILE: source\tdkr_obb_scan.h =====
+/* nm9_obb_scan.h -- which file in the obb folder is the main / the patch
+ * expansion file, whatever the player called it. Shared by the game program
+ * (nm9_obb.c) and the launcher (launcher/source/nm9_launcher.c): plain
+ * libc, no libnx. MIT.
+ *
+ * The game's own names are datakrhm.obb and patchkrhm.obb; Google's are
+ * main.<version>.<package>.obb and patch.<version>.<package>.obb. A name
+ * starting with "patch" is the patch; any other .obb is the main file. Of
+ * several, the exact game name wins, else the last by name (the newest
+ * version).
+ */
+#ifndef nm9_OBB_SCAN_H
+#define nm9_OBB_SCAN_H
+
+#include <dirent.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+
+static inline int nm9_obb_exact(const char *n) {
+  return !strcasecmp(n, "datakrhm.obb") || !strcasecmp(n, "patchkrhm.obb");
+}
+
+/* 1 and dir/<name> in out when the folder has the file for the role. */
+static inline int nm9_obb_scan(const char *dir, int patch, char *out, size_t cap) {
+  DIR *d = opendir(dir);
+  if (!d)
+    return 0;
+  char best[256] = "";
+  struct dirent *e;
+  while ((e = readdir(d))) {
+    const char *n = e->d_name;
+    size_t l = strlen(n);
+    if (l < 5 || l >= sizeof best || n[0] == '.' || strcasecmp(n + l - 4, ".obb"))
+      continue;
+    if ((strncasecmp(n, "patch", 5) == 0) != (patch != 0))
+      continue;
+    if (!best[0] || nm9_obb_exact(n) || (!nm9_obb_exact(best) && strcmp(n, best) > 0))
+      memcpy(best, n, l + 1);
+  }
+  closedir(d);
+  if (!best[0])
+    return 0;
+  snprintf(out, cap, "%s/%s", dir, best);
+  return 1;
+}
+
+#endif /* nm9_OBB_SCAN_H */
+
+===== FILE: source\touchmap.c =====
+/* touchmap.c -- the shared finger pool and the pad driver. MIT. */
+#include <math.h>
+#include <string.h>
+#include <switch.h>
+
+#include "touchmap.h"
+#include "util.h"
+
+#define MAX_SLOTS 24
+
+static tm_touch_fn g_touch;
+static tm_key_fn g_key;
+static int g_log_max = 200, g_logged;
+
+static struct {
+  int used;
+  uint32_t key;
+  int x, y;
+} g_slot[MAX_SLOTS];
+
+static TmPad g_pad_cfg;
+static int g_joy_on, g_cam_on, g_cam_x, g_cam_y;
+
+void tm_init(tm_touch_fn touch, tm_key_fn key) {
+  g_touch = touch;
+  g_key = key;
+}
+
+int tm_log_cap(int max_lines) {
+  int old = g_log_max;
+  g_log_max = max_lines;
+  return old;
+}
+
+static void emit(int action, int x, int y, int id) {
+  if (g_logged < g_log_max) {
+    g_logged++;
+    debugPrintf("[input] touch a=%d x=%d y=%d id=%d\n", action, x, y, id);
+  }
+  if (g_touch)
+    g_touch(action, x, y, id);
+}
+
+static int acquire(uint32_t key) {
+  for (int k = 0; k < MAX_SLOTS; k++)
+    if (g_slot[k].used && g_slot[k].key == key)
+      return k;
+  for (int k = 0; k < MAX_SLOTS; k++)
+    if (!g_slot[k].used) {
+      g_slot[k].used = 1;
+      g_slot[k].key = key;
+      g_slot[k].x = g_slot[k].y = -1;
+      return k;
+    }
+  return -1;
+}
+
+static int find(uint32_t key) {
+  for (int k = 0; k < MAX_SLOTS; k++)
+    if (g_slot[k].used && g_slot[k].key == key)
+      return k;
+  return -1;
+}
+
+int tm_down(uint32_t key, int x, int y) {
+  int s = acquire(key);
+  if (s < 0)
+    return -1;
+  g_slot[s].x = x, g_slot[s].y = y;
+  emit(0, x, y, s);
+  return s;
+}
+
+int tm_move(uint32_t key, int x, int y) {
+  int s = acquire(key);
+  if (s < 0)
+    return -1;
+  if (g_slot[s].x < 0) {
+    g_slot[s].x = x, g_slot[s].y = y;
+    emit(0, x, y, s);
+  } else if (x != g_slot[s].x || y != g_slot[s].y) {
+    g_slot[s].x = x, g_slot[s].y = y;
+    emit(2, x, y, s);
+  }
+  return s;
+}
+
+int tm_up(uint32_t key) {
+  int s = find(key);
+  if (s < 0)
+    return -1;
+  emit(1, g_slot[s].x, g_slot[s].y, s);
+  g_slot[s].used = 0;
+  return s;
+}
+
+#define VJOY_KEY 0x80000000u
+#define VCAM_KEY 0x80000001u
+#define VBIND_KEY(i) (0x80000010u | (uint32_t)(i))
+
+void tm_pad_config(const TmPad *p) {
+  if (p)
+    g_pad_cfg = *p;
+  else
+    memset(&g_pad_cfg, 0, sizeof g_pad_cfg);
+}
+
+/* Zone/menu change: lift the held drag fingers so nothing stays pressed. */
+void tm_pad_reset(void) {
+  if (g_joy_on) {
+    g_joy_on = 0;
+    tm_up(VJOY_KEY);
+  }
+  if (g_cam_on) {
+    g_cam_on = 0;
+    tm_up(VCAM_KEY);
+  }
+}
+
+/* 1280x720-space point to window pixels. */
+static int scX(int x, int w) { return (int)((int64_t)x * w / 1280); }
+static int scY(int y, int h) { return (int)((int64_t)y * h / 720); }
+
+void tm_pad_poll(u64 now, u64 down, u64 up, const float *sticks, int win_w, int win_h) {
+  if (!g_pad_cfg.enable)
+    return;
+  float lx = sticks[0], ly = sticks[1], rx = sticks[2], ry = sticks[3];
+  /* The D-pad drives the joystick at full tilt when the stick rests. */
+  if (lx * lx + ly * ly < 0.09f) {
+    float dx = ((now & HidNpadButton_Right) ? 1.0f : 0.0f) - ((now & HidNpadButton_Left) ? 1.0f : 0.0f);
+    float dy = ((now & HidNpadButton_Up) ? 1.0f : 0.0f) - ((now & HidNpadButton_Down) ? 1.0f : 0.0f);
+    if (dx != 0.0f || dy != 0.0f) {
+      float m = sqrtf(dx * dx + dy * dy);
+      lx = dx / m;
+      ly = dy / m;
+    }
+  }
+  float lm = sqrtf(lx * lx + ly * ly), rm = sqrtf(rx * rx + ry * ry);
+
+  /* Left input: hold-and-drag the widget (hysteresis 0.25/0.15). */
+  if (!g_joy_on && lm > 0.25f && g_pad_cfg.touch) {
+    g_joy_on = 1;
+    tm_down(VJOY_KEY, scX(g_pad_cfg.joy_x, win_w), scY(g_pad_cfg.joy_y, win_h));
+  }
+  if (g_joy_on) {
+    if (lm < 0.15f || !g_pad_cfg.touch) {
+      g_joy_on = 0;
+      tm_up(VJOY_KEY);
+    } else {
+      int r = g_pad_cfg.joy_r < 10 ? 10 : g_pad_cfg.joy_r;
+      tm_move(VJOY_KEY, scX(g_pad_cfg.joy_x, win_w) + (int)(lx * r * win_w / 1280),
+              scY(g_pad_cfg.joy_y, win_h) - (int)(ly * r * win_h / 720));
+    }
+  }
+
+  /* Right stick: swipe to look, ratcheting back past cam_r (unless a
+   * native stick owns it: cam_touch 0). */
+  if (!g_cam_on && rm > 0.25f && g_pad_cfg.cam_touch && g_pad_cfg.touch) {
+    g_cam_on = 1;
+    g_cam_x = 640;
+    g_cam_y = 360;
+    tm_down(VCAM_KEY, scX(g_cam_x, win_w), scY(g_cam_y, win_h));
+  }
+  if (g_cam_on) {
+    if (rm < 0.15f || !g_pad_cfg.touch || !g_pad_cfg.cam_touch) {
+      g_cam_on = 0;
+      tm_up(VCAM_KEY);
+    } else {
+      int sp = g_pad_cfg.cam_speed < 1 ? 1 : g_pad_cfg.cam_speed;
+      int rr = g_pad_cfg.cam_r < 20 ? 20 : g_pad_cfg.cam_r;
+      g_cam_x += (int)(rx * sp);
+      g_cam_y -= (int)(ry * sp);
+      int dx = g_cam_x - 640, dy = g_cam_y - 360;
+      if (dx * dx + dy * dy > rr * rr) {
+        tm_up(VCAM_KEY);
+        g_cam_x = 640;
+        g_cam_y = 360;
+        tm_down(VCAM_KEY, scX(g_cam_x, win_w), scY(g_cam_y, win_h));
+      } else {
+        tm_move(VCAM_KEY, scX(g_cam_x, win_w), scY(g_cam_y, win_h));
+      }
+    }
+  }
+
+  /* Buttons: taps and/or keys (nothing to do with no edges). */
+  if (down | up)
+    for (int i = 0; i < g_pad_cfg.nbinds; i++) {
+      const TmBind *b = &g_pad_cfg.binds[i];
+      if (g_pad_cfg.touch && b->tap_x >= 0) {
+        if (down & b->btn)
+          tm_down(VBIND_KEY(i), scX(b->tap_x, win_w), scY(b->tap_y, win_h));
+        if (up & b->btn)
+          tm_up(VBIND_KEY(i));
+      }
+      if ((down & b->btn) && b->key >= 0 && g_key)
+        g_key(b->key, 1);
+      if ((up & b->btn) && b->key >= 0 && g_key)
+        g_key(b->key, 0);
+    }
+}
+
+===== FILE: source\touchmap.h =====
+/* touchmap.h -- gamepad -> touch/key mapper for android32 Switch ports.
+ *
+ * The pattern of the Vita mapping tables (a button list with what each one
+ * does), rebuilt for touch games: physical buttons become taps (and/or
+ * Android key events), the sticks become drags, all through one shared finger
+ * pool so ids stay small (0-15) and never collide between the touch screen
+ * and the pad. A port fills a TmPad (usually from config.ini) and calls
+ * tm_pad_poll() every frame; its own touch screen uses tm_down/move/up.
+ * The engine callbacks: touch(action 0 down, 1 up, 2 move, window pixels,
+ * id) and key(android keycode, down 1/0). MIT.
+ */
+#ifndef TOUCHMAP_H
+#define TOUCHMAP_H
+
+#include <stdint.h>
+#include <switch.h>
+
+typedef void (*tm_touch_fn)(int action, int x, int y, int id);
+typedef void (*tm_key_fn)(int keycode, int down);
+
+void tm_init(tm_touch_fn touch, tm_key_fn key);
+/* [input] log lines left (capped); call with 0 to mute. Returns the old cap. */
+int tm_log_cap(int max_lines);
+
+/* Shared finger pool. Real fingers key by anything below 0x80000000u. */
+int tm_down(uint32_t key, int x, int y); /* new finger -> id, or -1 when full */
+int tm_move(uint32_t key, int x, int y); /* down if fresh, else move -> id/-1 */
+int tm_up(uint32_t key);                 /* up at its last spot -> id/-1 */
+
+/* One physical button: a tap (tap_x < 0: none) and/or a key (key < 0: none). */
+typedef struct {
+  u64 btn;
+  int tap_x, tap_y; /* 1280x720 space, scaled to the window */
+  int key;          /* Android keycode */
+} TmBind;
+
+typedef struct {
+  int enable;      /* the pad drives anything at all */
+  int touch;       /* taps and stick drags (keys always follow their binds) */
+  int joy_x, joy_y, joy_r; /* left stick / D-pad widget (1280x720 space) */
+  int cam_speed, cam_r;    /* right stick look (touch swipe) */
+  int cam_touch;   /* 1: swipe for the right stick; 0: a native stick owns it */
+  const TmBind *binds;
+  int nbinds;
+} TmPad;
+
+void tm_pad_config(const TmPad *p);
+/* sticks: lx, ly, rx, ry, y up. D-pad in `now` drives the joystick too. */
+void tm_pad_poll(u64 now, u64 down, u64 up, const float *sticks, int win_w, int win_h);
+/* Lift the held stick-drag fingers (menu/gameplay change). */
+void tm_pad_reset(void);
+
+#endif /* TOUCHMAP_H */
+

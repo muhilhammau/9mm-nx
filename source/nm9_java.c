@@ -1,0 +1,211 @@
+﻿/* nm9_java.c -- the Java the 9mm engine talks to.
+ *
+ * libCopStory.so looks static methods up on two classes it is handed by the
+ * natives (GLSurfaceView's world), and a few Android classes:
+ *   GLGame        GLGame_nativeInit: sendAppToBackground, Exit, IsWifiEnabled,
+ *                 Is3GEnabled, isExternalMusicActive, IsAcerA500, IsSGHi897,
+ *                 HasGyroscope, isNotUseSoundEngine, IsSCHi510,
+ *                 IsUseExternalCard1, isHTC, launchGetGames, OpenBrowser,
+ *                 getVersion, getHostName, OpenMPOnlineLogin, OpenEnterNickName,
+ *                 detectLanguage, setSleep, GetUUID, openReviewGame, getWifiIP,
+ *                 launchGLLive, notifyTrophy, getGLLUserName, ShowSpinner,
+ *                 DismissSpinner, DetectDeviceGPU, GameTracking, getBuildType
+ *                 (names read from the ARM code of GLGame_nativeInit; the
+ *                 signatures of most are not settled, so the entries match any)
+ *   GameRenderer  GameRenderer_nativeInit: getKeyboardText ()[B,
+ *                 setKeyboard (ILjava/lang/String;I)V, isKeyboardVisible ()I,
+ *                 swapEGLBuffers ()V   <- the frame's eglSwapBuffers
+ *   android/media/AudioTrack (nm9_audio.c), Activity.setRequestedOrientation,
+ *   android/os/Build, Build$VERSION, SystemProperties, Settings$Secure,
+ *   TelephonyManager, ViewRoot, java/util/UUID.
+ * Every method not in the table is answered by the runtime with a default
+ * (0, false, null, "") and logged once: [debug] log_java_calls shows them all.
+ * Online services (Gameloft Live, billing, reviews, browser) answer "nothing
+ * there"; the DRM natives (GDRMPolicy, GameInstaller, iab) are never called. MIT. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <switch.h>
+
+#include "dcr_path.h"
+#include "dcr_setup.h"
+#include "rt_applet.h"
+#include "rt_cfg.h"
+#include "rt_window.h"
+#include "nm9.h"
+#include "util.h"
+
+#define GAME NM9_CLS_GAME
+#define REND NM9_CLS_REND
+
+Nm9Native g_nat;
+void *g_game_cls;
+void *g_rend_cls;
+
+/* ---------------------------------------------------- the frame / the screen */
+/* GameRenderer.swapEGLBuffers(): the engine's own swap, after each render. */
+static jvalue h_swap(JObj *self, const jvalue *a, const JMethod *m) {
+  nm9_egl_swap();
+  return jv_none();
+}
+static jvalue h_kbtext(JObj *self, const jvalue *a, const JMethod *m) {
+  return jv_l(jni_array('B', 1)); /* one zero byte: an empty C string */
+}
+
+/* ------------------------------------------------------------- the device */
+static jvalue h_exit(JObj *self, const jvalue *a, const JMethod *m) {
+  rt_request_exit();
+  return jv_none();
+}
+static jvalue h_version(JObj *self, const jvalue *a, const JMethod *m) { return jv_l(jni_str("1.0.1")); }
+static jvalue h_host(JObj *self, const jvalue *a, const JMethod *m) { return jv_l(jni_str("localhost")); }
+static jvalue h_buildtype(JObj *self, const jvalue *a, const JMethod *m) { return jv_l(jni_str("release")); }
+static jvalue h_lang(JObj *self, const jvalue *a, const JMethod *m) { return jv_l(jni_str("en")); }
+static jvalue h_uuid(JObj *self, const jvalue *a, const JMethod *m) { return jv_l(jni_str("9mmnx0000000001")); }
+static jvalue h_wifiip(JObj *self, const jvalue *a, const JMethod *m) { return jv_l(jni_str("0.0.0.0")); }
+static jvalue h_gpu(JObj *self, const jvalue *a, const JMethod *m) { return jv_l(jni_str("NVIDIA Tegra X1")); }
+static jvalue h_context(JObj *self, const jvalue *a, const JMethod *m) {
+  return jv_l(jni_singleton("android/content/Context"));
+}
+
+/* ---------------------------------------------------------------- tables */
+const JMethodDef jni_method_defs[] = {
+    /* GLGame: the device and the system */
+    {GAME, "Exit", NULL, h_exit},
+    {GAME, "sendAppToBackground", NULL, jni_h_void},
+    {GAME, "IsWifiEnabled", NULL, jni_h_false},
+    {GAME, "Is3GEnabled", NULL, jni_h_false},
+    {GAME, "isExternalMusicActive", NULL, jni_h_false},
+    {GAME, "IsAcerA500", NULL, jni_h_false},
+    {GAME, "IsSGHi897", NULL, jni_h_false},
+    {GAME, "IsSCHi510", NULL, jni_h_false},
+    {GAME, "IsUseExternalCard1", NULL, jni_h_false},
+    {GAME, "isHTC", NULL, jni_h_false},
+    {GAME, "HasGyroscope", NULL, jni_h_false},
+    {GAME, "isNotUseSoundEngine", NULL, jni_h_false},
+    {GAME, "setSleep", NULL, jni_h_void},
+    {GAME, "getVersion", NULL, h_version},
+    {GAME, "getHostName", NULL, h_host},
+    {GAME, "getBuildType", NULL, jni_h_zero},
+    {GAME, "detectLanguage", NULL, jni_h_zero},
+    {GAME, "GetUUID", NULL, h_uuid},
+    {GAME, "getWifiIP", NULL, jni_h_zero},
+    {GAME, "DetectDeviceGPU", NULL, jni_h_zero},
+    /* online services, the store, the browser, Gameloft Live: nothing there */
+    {GAME, "launchGetGames", NULL, jni_h_void},
+    {GAME, "OpenBrowser", NULL, jni_h_void},
+    {GAME, "OpenMPOnlineLogin", NULL, jni_h_void},
+    {GAME, "OpenEnterNickName", NULL, jni_h_void},
+    {GAME, "openReviewGame", NULL, jni_h_void},
+    {GAME, "launchGLLive", NULL, jni_h_void},
+    {GAME, "notifyTrophy", NULL, jni_h_void},
+    {GAME, "getGLLUserName", NULL, jni_h_zero},
+    {GAME, "ShowSpinner", NULL, jni_h_void},
+    {GAME, "DismissSpinner", NULL, jni_h_void},
+    {GAME, "GameTracking", NULL, jni_h_void},
+    /* GameRenderer: the keyboard and the swap */
+    {REND, "swapEGLBuffers", NULL, h_swap},
+    {REND, "getKeyboardText", NULL, h_kbtext},
+    {REND, "setKeyboard", NULL, jni_h_void},
+    {REND, "isKeyboardVisible", NULL, jni_h_zero},
+    /* Android */
+    {"android/content/Context", "getApplicationContext", NULL, h_context},
+    {"android/app/Activity", "setRequestedOrientation", NULL, jni_h_void},
+    {"android/os/Process", "setThreadPriority", NULL, jni_h_void},
+    /* the sound */
+    {"android/media/AudioTrack", "<init>", "(IIIIII)V", nm9_at_init},
+    {"android/media/AudioTrack", "getMinBufferSize", NULL, nm9_at_min_buffer},
+    {"android/media/AudioTrack", "getNativeOutputSampleRate", NULL, nm9_at_native_rate},
+    {"android/media/AudioTrack", "play", NULL, nm9_at_play},
+    {"android/media/AudioTrack", "pause", NULL, nm9_at_pause},
+    {"android/media/AudioTrack", "stop", NULL, nm9_at_stop},
+    {"android/media/AudioTrack", "release", NULL, nm9_at_release},
+    {"android/media/AudioTrack", "write", NULL, nm9_at_write},
+    {"android/media/AudioTrack", "getPlayState", NULL, nm9_at_state},
+    {NULL, NULL, NULL, NULL},
+};
+
+/* GetPhoneInfo (libCopStory) reads android/os/Build and friends. Strings only;
+ * Build$VERSION.SDK_INT and the other ints are left to the runtime's default
+ * (0) until JFieldDef's int form is checked in jni.h. */
+const JFieldDef jni_field_defs[] = {
+    {"android/os/Build", "MANUFACTURER", NULL, 0, "NVIDIA"},
+    {"android/os/Build", "BRAND", NULL, 0, "NVIDIA"},
+    {"android/os/Build", "MODEL", NULL, 0, "SHIELD Android TV"},
+    {"android/os/Build", "DEVICE", NULL, 0, "foster"},
+    {"android/os/Build", "PRODUCT", NULL, 0, "foster"},
+    {"android/os/Build", "HARDWARE", NULL, 0, "tegra"},
+    {"android/os/Build", "CPU_ABI", NULL, 0, "armeabi-v7a"},
+    {"android/os/Build$VERSION", "RELEASE", NULL, 0, "6.0.1"},
+    {NULL, NULL, NULL, 0, NULL},
+};
+
+const char *const jni_class_supers[][2] = {
+    {GAME, "android/app/Activity"},
+    {NULL, NULL},
+};
+
+/* Classes a phone running this APK would NOT have: the Google / Amazon services. */
+const char *const jni_missing_classes[] = {
+    "com/google/android/gms/*", "com/android/vending/*", "com/amazon/*", NULL,
+};
+
+/* ------------------------------------------------------------------ zones */
+/* The crosshair is not wanted in 9mm's menus, and no zone detection exists
+ * yet: always "menu", so nothing is drawn. */
+
+/* -------------------------------------------------------------- monitors */
+/* JNIEnv's MonitorEnter and MonitorExit, which the runtime answers without
+ * locking anything (jni_core.c: both return 0). An engine whose loading threads
+ * share buffers through a monitor then reads each other's bytes (the Dead
+ * Space port saw it). One lock per object locked (few, never let go), patched
+ * into the JNI table's standard slots (217/218). Uncontended it costs one
+ * mutex round-trip. */
+#define JNI_MONITOR_ENTER 217
+#define JNI_MONITOR_EXIT  218
+#define MAX_MONITORS 16
+
+static struct {
+  const void *obj;
+  RMutex lock;
+} g_monitors[MAX_MONITORS];
+static int g_nmonitors;
+static Mutex g_monitors_lock;
+
+static RMutex *monitor_of(const void *obj) {
+  mutexLock(&g_monitors_lock);
+  int i = 0;
+  while (i < g_nmonitors && g_monitors[i].obj != obj)
+    i++;
+  if (i == MAX_MONITORS) {
+    i--; /* more objects than locks: the last one is shared */
+  } else if (i == g_nmonitors) {
+    g_monitors[i].obj = obj;
+    rmutexInit(&g_monitors[i].lock);
+    g_nmonitors++;
+    debugPrintf("[java] a monitor for %p\n", obj);
+  }
+  mutexUnlock(&g_monitors_lock);
+  return &g_monitors[i].lock;
+}
+
+static int monitor_enter(void *env, void *obj) {
+  (void)env;
+  rmutexLock(monitor_of(obj));
+  return 0;
+}
+
+static int monitor_exit(void *env, void *obj) {
+  (void)env;
+  rmutexUnlock(monitor_of(obj));
+  return 0;
+}
+
+void nm9_java_patch_monitors(void) {
+  mutexInit(&g_monitors_lock);
+  void **env = *(void ***)g_jni_env; /* the function table */
+  env[JNI_MONITOR_ENTER] = (void *)monitor_enter;
+  env[JNI_MONITOR_EXIT] = (void *)monitor_exit;
+}
+
+

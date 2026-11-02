@@ -1,0 +1,10 @@
+prefix=${pcfiledir}/../..
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: glapi
+Description: Mesa OpenGL shared library
+Version: 20.1.0-rc3
+Libs: -L${libdir} -lglapi
+Libs.private: -lm
+Cflags: -I${includedir}

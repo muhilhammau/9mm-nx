@@ -1,0 +1,31 @@
+# Build outputs
+build/
+*.elf
+*.nsp
+*.build
+
+# Debug logs
+debug_*.log
+*_diag*.log
+*_diag*.txt
+disasm*.txt
+gen_log.txt
+jni_strings.txt
+jni_syms.txt
+swp_scan.txt
+tdkr_leftovers.txt
+
+# Build logs
+build_log.txt
+launcher_log.txt
+
+# Temporary files
+-Pattern
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/

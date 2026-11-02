@@ -1,0 +1,11 @@
+# 9mm HD (libCopStory.so) -- modules, in load order.
+# libStormGLOFT.so first: libCopStory.so has no unwinder or C++ runtime of its
+# own; it imports _Unwind_*, __gnu_unwind_frame and __aeabi_unwind_cpp_pr* from
+# it (as Java would: System.loadLibrary StormGLOFT, then CopStory).
+# libSecShell*.so and libnativedummy.so are NOT loaded.
+MODULES libStormGLOFT.so libCopStory.so
+
+# libgcc helpers that libCopStory imports and libStormGLOFT does not define.
+PASSTHROUGH __aeabi_d2f __aeabi_dcmpeq __aeabi_fcmpeq __aeabi_fcmpun __aeabi_uldivmod
+
+DATA __dso_handle __dso_handle
