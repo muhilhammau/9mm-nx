@@ -26,7 +26,7 @@ The supported game build is:
 ```	ext
 Package:      com.gameloft.android.ANMP.Gloft9MHM
 Version:      1.0.1
-Version code: 110
+Version code: 101
 ABI:          armeabi-v7a / AArch32
 ```
 
