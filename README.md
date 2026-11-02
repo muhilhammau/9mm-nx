@@ -23,12 +23,12 @@ An unofficial Nintendo Switch wrapper/port of Gameloft's Android game.
 
 The supported game build is:
 
-`	ext
+```	ext
 Package:      com.gameloft.android.ANMP.Gloft9MHM
 Version:      1.1.0
 Version code: 110
 ABI:          armeabi-v7a / AArch32
-`
+```
 
 The original ARM game libraries (libCopStory.so, libStormGLOFT.so) run directly inside a 32-bit Horizon OS process. Players must provide their own APK and game data files (gameloft/games/Gloft9MHM/); these are not included in the repository or release download.
 
@@ -71,7 +71,7 @@ The original ARM game libraries (libCopStory.so, libStormGLOFT.so) run directly 
 
 Copy the switch/ folder to the root of your SD card. Ensure the game files are placed according to the layout below:
 
-`	ext
+```	ext
 sd:/switch/9mm_nx/
 ├── 9mm_nx.nro
 ├── 9mm.apk
@@ -82,7 +82,7 @@ sd:/switch/9mm_nx/
             ├── sounds_hi.glza
             ├── *.dat
             └── ...
-`
+```
 
 ### First launch
 
@@ -117,14 +117,14 @@ sd:/switch/9mm_nx/
 
 The application directory is located under sd:/switch/9mm_nx/:
 
-`	ext
+```	ext
 data/              Android internal storage and native saves
 gameloft/          Gameloft shared data (gameloft/games/Gloft9MHM/)
 sdcard/            Android external storage root
 config.ini         Custom control mapping overrides
 debug.log          Current execution log
 crash.log          Crash diagnostics output
-`
+```
 
 ## Building
 
@@ -140,11 +140,11 @@ untime/ (Git submodule).
 
 ### Build steps
 
-`powershell
+```powershell
 git submodule update --init --recursive
 .\build.ps1
 cd launcher; ./build.sh
-`
+```
 
 The compiled binary will be located at launcher/9mm_nx.nro.
 
